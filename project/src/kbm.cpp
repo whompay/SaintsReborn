@@ -120,6 +120,7 @@ struct MouseState {
 };
 MouseState g_mouse;
 std::mutex g_mouse_mutex;
+std::atomic<bool> g_mouse_suspended{false};  // e.g. while the display menu is open
 bool g_pause_menu_active = false;
 bool g_pause_toggle_down = false;
 std::chrono::steady_clock::time_point g_pause_toggled{};
@@ -140,6 +141,10 @@ void ReleaseMouseLocked() {
 // middle of the game window. Returns the movement in pixels.
 void PollMouseLocked(double& dx, double& dy) {
   dx = dy = 0;
+  if (g_mouse_suspended.load(std::memory_order_relaxed)) {
+    ReleaseMouseLocked();
+    return;
+  }
   HWND window = GetForegroundWindow();
   RECT client;
   if (!window || !GetClientRect(window, &client)) {
@@ -265,6 +270,11 @@ bool g_esc_released = false;
 
 Pad ReadKeyboard(uint8_t* base, bool pause_menu, bool player_creation) {
   Pad p;
+  // Game input is suspended while an interactive overlay (display menu) is
+  // open: clicks and keys belong to the overlay, not the game.
+  if (g_mouse_suspended.load(std::memory_order_relaxed)) {
+    return p;
+  }
   const bool in_vehicle = PlayerInVehicle(base);
   auto press = [&](bool down, uint16_t button) {
     if (down) p.buttons |= button;
@@ -365,6 +375,18 @@ void sr::SetMouseSensitivity(double sensitivity) {
   g_sensitivity.store(sensitivity, std::memory_order_relaxed);
 }
 
+void sr::SetMouseCaptureSuspended(bool suspended) {
+#ifdef _WIN32
+  g_mouse_suspended.store(suspended, std::memory_order_relaxed);
+  if (suspended) {
+    std::lock_guard<std::mutex> lock(g_mouse_mutex);
+    ReleaseMouseLocked();
+  }
+#else
+  (void)suspended;
+#endif
+}
+
 void sr::AddMouseWheel(int delta) {
 #ifdef _WIN32
   if (!delta) return;
@@ -400,6 +422,15 @@ PPC_FUNC_IMPL(__imp__XamInputGetState) {
   RefreshKeys();
   auto* state = reinterpret_cast<X_INPUT_STATE*>(base + state_addr);
   auto& pad = state->gamepad;
+  if (g_mouse_suspended.load(std::memory_order_relaxed)) {
+    // An interactive overlay (display menu) is open: all input belongs to
+    // it, so report a neutral pad to the game (keyboard, mouse and
+    // controller alike). The game ignores a state whose packet number
+    // hasn't changed, so keep it ticking.
+    memset(&pad, 0, sizeof(pad));
+    state->packet_number = uint32_t(state->packet_number) + 1;
+    return;
+  }
   bool pause_menu = UpdatePauseMenuState(base, uint16_t(pad.buttons));
   const bool player_creation = CharacterCreationInputActive(base);
   {

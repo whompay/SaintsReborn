@@ -24,17 +24,29 @@
 #endif
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/input/input_system.h>
+#include <rex/ui/imgui_drawer.h>
+#include <rex/ui/immediate_drawer.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app.h>
 
+#include "display_menu.h"
+
 #include <atomic>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <string>
 #include <thread>
 
 REXCVAR_DECLARE(bool, mnk_mode);
 REXCVAR_DECLARE(std::string, input_backend);
+REXCVAR_DECLARE(int32_t, window_width);
+REXCVAR_DECLARE(int32_t, window_height);
+REXCVAR_DECLARE(std::string, window_mode);
+REXCVAR_DECLARE(bool, fps_counter);
 
 #ifdef _WIN32
 #include <windows.h>
@@ -415,6 +427,9 @@ public:
     // F11 toggles between fullscreen and windowed, F1 shows the frame rate,
     // F10 cycles the frame rate cap (30/60/90/120).
     void OnKeyDown(rex::ui::KeyEvent& e) override {
+        if (rex::ui::ProcessKeyEvent(e)) {
+            return;
+        }
         if (e.virtual_key() == rex::ui::VirtualKey::kF11 && !e.prev_state() && window_) {
             window_->SetFullscreen(!window_->IsFullscreen());
             e.set_handled(true);
@@ -434,7 +449,7 @@ public:
     // The cursor is hidden while the game has focus (the mouse moves the camera).
     void OnGotFocus(rex::ui::UISetupEvent& e) override {
         (void)e;
-        if (window_) window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+        if (window_ && !display_dialog_) window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
     }
     void OnLostFocus(rex::ui::UISetupEvent& e) override {
         (void)e;
@@ -451,6 +466,17 @@ public:
 
     bool OnInitialize() override {
         auto exe_dir = rex::filesystem::GetExecutableFolder();
+
+        // Saved settings (fullscreen, window_width/height, keybinds, ...).
+        config_path_ = exe_dir / "saintsrow.toml";
+        bool config_sets_scale = false;
+        {
+            std::ifstream cfg(config_path_);
+            std::string text((std::istreambuf_iterator<char>(cfg)),
+                             std::istreambuf_iterator<char>());
+            config_sets_scale = text.find("draw_resolution_scale") != std::string::npos;
+        }
+        rex::cvar::LoadConfig(config_path_);
 
         // Game data: the command-line argument if given, otherwise a "game"
         // folder next to the exe, falling back to "extracted" two or one
@@ -499,12 +525,23 @@ public:
         window_->AddInputListener(this, 0);
         window_->Open();
         window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
-        // Start fullscreen unless a file named "start_windowed" exists next to the exe.
+        // Window mode from config ("windowed", "borderless", "fullscreen"),
+        // overridden by a "start_windowed" file next to the exe.
         {
+            const std::string mode = REXCVAR_GET(window_mode);
+            bool start_fullscreen = mode != "windowed";
             FILE* sw = std::fopen("start_windowed", "rb");
             if (sw) {
                 std::fclose(sw);
-            } else {
+                start_fullscreen = false;
+            }
+            if (start_fullscreen) {
+                if (mode == "fullscreen") {
+                    // Restore the display mode saved by the display menu
+                    // (no-op when it matches the desktop mode).
+                    ApplyFullscreenDisplayMode(window_.get(), REXCVAR_GET(window_width),
+                                               REXCVAR_GET(window_height));
+                }
                 window_->SetFullscreen(true);
             }
         }
@@ -549,15 +586,25 @@ public:
             sr::SetMouseSensitivity(sensitivity);
         }
         {
-            // Internal resolution scale (1-3, default 2), read from
-            // "res_scale.txt" next to the exe.
-            int scale = 2;
+            // Internal resolution scale override: if "res_scale.txt" exists next
+            // to the exe it wins over the config file (draw_resolution_scale_*).
             if (FILE* rf = std::fopen("res_scale.txt", "rb")) {
                 int v = 0;
+                int scale = 0;
                 if (std::fscanf(rf, "%d", &v) == 1 && v >= 1 && v <= 3) scale = v;
                 std::fclose(rf);
+                if (scale) {
+                    const std::string sv = std::to_string(scale);
+                    rex::cvar::SetFlagByName("draw_resolution_scale_x", sv);
+                    rex::cvar::SetFlagByName("draw_resolution_scale_y", sv);
+                    REXLOG_INFO("Draw resolution scale: {}x (res_scale.txt)", scale);
+                }
+            } else if (!config_sets_scale) {
+                // Default internal scale 2x (1440p) unless res_scale.txt or the
+                // config file says otherwise (SDK default is 1x).
+                rex::cvar::SetFlagByName("draw_resolution_scale_x", "2");
+                rex::cvar::SetFlagByName("draw_resolution_scale_y", "2");
             }
-            const std::string sv = std::to_string(scale);
             // The port hands the GPU every command buffer separately; ending a
             // host GPU submission after each one costs far more than it saves.
             // Submit once per frame instead.
@@ -635,9 +682,6 @@ public:
                 REXLOG_INFO("test_high_base: usual guest memory address {}", taken ? "taken" : "was already in use");
             }
 #endif
-            rex::cvar::SetFlagByName("draw_resolution_scale_x", sv);
-            rex::cvar::SetFlagByName("draw_resolution_scale_y", sv);
-            REXLOG_INFO("Draw resolution scale: {}x", scale);
         }
         REXCVAR_SET(input_backend, "xinput");
         config.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
@@ -720,6 +764,27 @@ public:
                 app_context().CallInUIThread([this, shown]() { fps_overlay_.SetModTextVisible(shown); });
             });
             window_->SetPresenter(gs->presenter());
+
+            // ImGui overlay stack: F5 opens the display settings menu.
+            immediate_drawer_ = gs->provider()->CreateImmediateDrawer();
+            immediate_drawer_->SetPresenter(gs->presenter());
+            imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_.get(), 64);
+            imgui_drawer_->SetPresenterAndImmediateDrawer(gs->presenter(), immediate_drawer_.get());
+            rex::ui::RegisterBind("bind_display_menu", "F5", "Toggle display settings menu", [this]() {
+                if (display_dialog_) {
+                    display_dialog_.reset();
+                } else {
+                    display_dialog_ = std::make_unique<DisplaySettingsDialog>(
+                        imgui_drawer_.get(), window_.get(), config_path_, &fps_overlay_,
+                        [this](bool visible) {
+                            app_context().CallInUIThreadDeferred(
+                                [this, visible] { fps_overlay_.SetVisible(visible); });
+                        });
+                }
+            });
+            if (REXCVAR_GET(fps_counter)) {
+                fps_overlay_.SetVisible(true);
+            }
         } else {
             REXLOG_ERROR("No presenter available to connect to window");
         }
@@ -757,6 +822,12 @@ public:
     }
 
     void OnDestroy() override {
+        // Overlay teardown (dialog -> keybind -> drawer -> immediate drawer)
+        // must happen before the presenter is released.
+        display_dialog_.reset();
+        rex::ui::UnregisterBind("bind_display_menu");
+        imgui_drawer_.reset();
+        immediate_drawer_.reset();
         sr::StopPerfMonitor();
         sr::StopProfiler();
         wml::SetOverlayTextListener(nullptr);
@@ -777,6 +848,10 @@ public:
 private:
     std::unique_ptr<rex::Runtime> runtime_;
     std::unique_ptr<rex::ui::Window> window_;
+    std::unique_ptr<rex::ui::ImmediateDrawer> immediate_drawer_;
+    std::unique_ptr<rex::ui::ImGuiDrawer> imgui_drawer_;
+    std::unique_ptr<DisplaySettingsDialog> display_dialog_;
+    std::filesystem::path config_path_;
     sr::FpsOverlay fps_overlay_;
     std::thread module_thread_;
     std::atomic<bool> shutting_down_{false};

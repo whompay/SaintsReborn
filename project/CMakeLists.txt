@@ -64,6 +64,7 @@ target_include_directories(wml_minhook PUBLIC ${minhook_SOURCE_DIR}/include)
 set(SAINTSROW_SOURCES
     src/main.cpp
     src/stubs.cpp
+    src/display_menu.cpp
     src/fps_overlay.cpp
     src/perf_monitor.cpp
     src/kbm.cpp

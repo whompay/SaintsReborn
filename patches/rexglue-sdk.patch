@@ -447,112 +447,6 @@ index 4c57a18..57341ec 100644
      return X_STATUS_SUCCESS;
    } else {
      return X_STATUS_END_OF_FILE;
-diff --git a/src/filesystem/devices/read_cache.h b/src/filesystem/devices/read_cache.h
-new file mode 100644
---- /dev/null
-+++ b/src/filesystem/devices/read_cache.h
-@@ -0,0 +1,101 @@
-+#pragma once
-+
-+#include <algorithm>
-+#include <cstdint>
-+#include <cstring>
-+#include <list>
-+#include <mutex>
-+#include <span>
-+#include <unordered_map>
-+#include <vector>
-+
-+namespace rex::filesystem {
-+
-+// Exact-range cache for immutable game files. Misses retain the original host
-+// read, including its short-read/error behavior; only complete reads are stored.
-+// IDs belong to open handles, so closing/reopening cannot reuse stale contents.
-+class ReadCache {
-+ public:
-+  struct Stats { uint64_t hits = 0, misses = 0, saved_bytes = 0; size_t bytes = 0, entries = 0; };
-+  void SetBudget(size_t bytes) {
-+    std::lock_guard lock(mutex_);
-+    budget_ = bytes;
-+    Trim(0);
-+  }
-+  bool Read(uint64_t file, size_t offset, std::span<uint8_t> output) {
-+    std::lock_guard lock(mutex_);
-+    auto it = entries_.find(Key{file, offset, output.size()});
-+    if (it == entries_.end()) { ++stats_.misses; return false; }
-+    auto node = it->second;
-+    std::memcpy(output.data(), node->data.data(), output.size());
-+    lru_.splice(lru_.begin(), lru_, node);
-+    ++stats_.hits;
-+    stats_.saved_bytes += output.size();
-+    return true;
-+  }
-+  void Store(uint64_t file, size_t offset, std::span<const uint8_t> input) {
-+    std::lock_guard lock(mutex_);
-+    if (input.empty() || input.size() > budget_ || input.size() > 1024 * 1024) return;
-+    Key key{file, offset, input.size()};
-+    if (entries_.contains(key)) return;
-+    // Allocate before changing accounting. Cache failure must not fail the read.
-+    try {
-+      std::vector<uint8_t> copy(input.begin(), input.end());
-+      Trim(input.size());
-+      lru_.push_front(Node{key, std::move(copy)});
-+      try {
-+        entries_.emplace(key, lru_.begin());
-+      } catch (...) {
-+        lru_.pop_front();
-+        throw;
-+      }
-+      stats_.bytes += input.size();
-+    } catch (const std::bad_alloc&) {
-+      // The caller already has valid data; caching is optional.
-+    }
-+  }
-+  void EraseFile(uint64_t file) {
-+    std::lock_guard lock(mutex_);
-+    for (auto it = lru_.begin(); it != lru_.end();) {
-+      if (it->key.file != file) { ++it; continue; }
-+      stats_.bytes -= it->data.size();
-+      entries_.erase(it->key);
-+      it = lru_.erase(it);
-+    }
-+  }
-+  Stats GetStats() {
-+    std::lock_guard lock(mutex_);
-+    auto result = stats_;
-+    result.entries = entries_.size();
-+    return result;
-+  }
-+ private:
-+  struct Key {
-+    uint64_t file;
-+    size_t offset, size;
-+    bool operator==(const Key&) const = default;
-+  };
-+  struct Hash {
-+    size_t operator()(const Key& key) const {
-+      size_t h = std::hash<uint64_t>{}(key.file);
-+      h ^= std::hash<size_t>{}(key.offset) + 0x9e3779b9 + (h << 6) + (h >> 2);
-+      return h ^ (std::hash<size_t>{}(key.size) + 0x9e3779b9 + (h << 6) + (h >> 2));
-+    }
-+  };
-+  struct Node { Key key; std::vector<uint8_t> data; };
-+  void Trim(size_t incoming) {
-+    while (!lru_.empty() && (stats_.bytes > budget_ - incoming ||
-+           (incoming != 0 && entries_.size() >= 32768))) {
-+      auto& node = lru_.back();
-+      stats_.bytes -= node.data.size();
-+      entries_.erase(node.key);
-+      lru_.pop_back();
-+    }
-+  }
-+  std::mutex mutex_;
-+  size_t budget_ = 0;
-+  Stats stats_;
-+  std::list<Node> lru_;
-+  std::unordered_map<Key, std::list<Node>::iterator, Hash> entries_;
-+};
-+}  // namespace rex::filesystem
 diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
 index a1b4dad..c249c5b 100644
 --- a/src/filesystem/virtual_file_system.cpp
@@ -1636,6 +1530,35 @@ index 19874a5..7f7841e 100644
  }
  
  uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..a1f731e 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -3798,6 +3798,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     const std::vector<Transfer>* render_target_transfers,
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle) {
++  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeRenderTargetTransfer);
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index a5c97a0..8b2ec69 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -303,9 +303,12 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
+ 
+ bool D3D12SharedMemory::UploadRanges(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
++  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeUpload);
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++  ++command_processor_.gpu_count_uploads_;
++  for (auto& r : upload_page_ranges) command_processor_.gpu_count_upload_bytes_ += uint64_t(r.second) << page_size_log2();
+   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+   command_processor_.SubmitBarriers();
+   auto& command_list = command_processor_.GetDeferredCommandList();
 diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
 index 2be0e8e..d15176c 100644
 --- a/src/graphics/d3d12/texture_cache.cpp
@@ -1828,6 +1751,73 @@ index 76f5600..6cb38fd 100644
    for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
      uint64_t l2_block = scaled_resolve_pages_l2_[i];
      if (i == l2_block_first) {
+diff --git a/src/graphics/pipeline/texture/util.cpp b/src/graphics/pipeline/texture/util.cpp
+index 26d554c..28ddc03 100644
+--- a/src/graphics/pipeline/texture/util.cpp
++++ b/src/graphics/pipeline/texture/util.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <unordered_map>
+ 
+ #include <rex/assert.h>
+ #include <rex/graphics/pipeline/texture/util.h>
+@@ -199,12 +200,54 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
+   return true;
+ }
+ 
++static TextureGuestLayout ComputeGuestTextureLayout(
++    xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32, uint32_t width_texels,
++    uint32_t height_texels, uint32_t depth_or_array_size, bool is_tiled, xenos::TextureFormat format,
++    bool has_packed_levels, bool has_base, uint32_t max_level);
++
++// The layout only depends on these parameters, and the same few hundred
++// textures are looked at on every draw, so results are kept per thread.
+ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
+                                          uint32_t base_pitch_texels_div_32, uint32_t width_texels,
+                                          uint32_t height_texels, uint32_t depth_or_array_size,
+                                          bool is_tiled, xenos::TextureFormat format,
+                                          bool has_packed_levels, bool has_base,
+                                          uint32_t max_level) {
++  struct Key {
++    uint64_t a, b;
++    bool operator==(const Key& o) const { return a == o.a && b == o.b; }
++  };
++  struct KeyHash {
++    size_t operator()(const Key& k) const {
++      return size_t(k.a * 0x9E3779B97F4A7C15ull ^ (k.b + 0x632BE59BD9B4E019ull + (k.a << 6)));
++    }
++  };
++  thread_local std::unordered_map<Key, TextureGuestLayout, KeyHash> cache;
++  const Key key{uint64_t(width_texels) | (uint64_t(height_texels) << 24) |
++                    (uint64_t(uint32_t(dimension) & 0xFF) << 48) |
++                    (uint64_t(uint32_t(format) & 0xFF) << 56),
++                uint64_t(base_pitch_texels_div_32) | (uint64_t(depth_or_array_size) << 24) |
++                    (uint64_t(max_level & 0xFF) << 48) | (uint64_t(is_tiled) << 56) |
++                    (uint64_t(has_packed_levels) << 57) | (uint64_t(has_base) << 58)};
++  auto it = cache.find(key);
++  if (it != cache.end()) {
++    return it->second;
++  }
++  if (cache.size() >= 8192) {
++    cache.clear();
++  }
++  TextureGuestLayout layout =
++      ComputeGuestTextureLayout(dimension, base_pitch_texels_div_32, width_texels, height_texels,
++                                depth_or_array_size, is_tiled, format, has_packed_levels, has_base,
++                                max_level);
++  cache.emplace(key, layout);
++  return layout;
++}
++
++static TextureGuestLayout ComputeGuestTextureLayout(
++    xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32, uint32_t width_texels,
++    uint32_t height_texels, uint32_t depth_or_array_size, bool is_tiled, xenos::TextureFormat format,
++    bool has_packed_levels, bool has_base, uint32_t max_level) {
+   TextureGuestLayout layout;
+ 
+   if (dimension == xenos::DataDimension::k1D) {
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
 index ec0df7c..f4c5d19 100644
 --- a/src/graphics/shared_memory.cpp
@@ -2107,6 +2097,89 @@ index 77bce25..1707cc2 100644
    }
  }
  
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..3841acf 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
++#include <cstdio>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -32,6 +33,15 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
+                     "Enable letterboxing for non-native aspect ratios");
+ 
++REXCVAR_DEFINE_STRING(present_aspect_mode, "letterbox", "UI/Presenter",
++                      "How guest output is fitted to the surface: letterbox (black bars), "
++                      "stretch (distort to fill) or crop (zoom to fill, cropping overflow)")
++    .allowed({"letterbox", "stretch", "crop"});
++
++REXCVAR_DEFINE_STRING(present_aspect_ratio, "auto", "UI/Presenter",
++                      "Aspect ratio to present the guest output at, as W:H (for example "
++                      "4:3, 16:9, 16:10, 21:9), or auto to use the guest video mode");
++
+ REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
+                      "Horizontal safe area percentage (0-100)")
+     .range(0, 100);
+@@ -556,6 +566,18 @@ bool Presenter::RefreshGuestOutput(
+   writable_properties.frontbuffer_height = frontbuffer_height;
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
++  {
++    // Optional presentation aspect ratio override ("4:3", "16:10", "21:9", ...).
++    // "auto" keeps the guest video mode's aspect.
++    const std::string& override_ar = REXCVAR_GET(present_aspect_ratio);
++    if (override_ar != "auto") {
++      unsigned int ax = 0, ay = 0;
++      if (std::sscanf(override_ar.c_str(), "%u:%u", &ax, &ay) == 2 && ax && ay) {
++        writable_properties.display_aspect_ratio_x = ax;
++        writable_properties.display_aspect_ratio_y = ay;
++      }
++    }
++  }
+   writable_properties.is_8bpc = false;
+   bool is_active = writable_properties.IsActive();
+   if (is_active) {
+@@ -899,7 +921,34 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+   // All host location calculations are DPI-independent, conceptually depending
+   // only on the aspect ratios, not the absolute values.
+   uint32_t output_width, output_height;
+-  if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
++  const std::string& aspect_mode = REXCVAR_GET(present_aspect_mode);
++  if (aspect_mode == "stretch") {
++    // Stretch to fill the entire surface, ignoring the aspect ratio (e.g.
++    // filling an ultrawide monitor with 16:9 guest output).
++    output_width = surface_width_in_paint_connection_;
++    output_height = surface_height_in_paint_connection_;
++    flow.output_x = 0;
++    flow.output_y = 0;
++  } else if (aspect_mode == "crop") {
++    // Zoom to cover the entire surface while preserving the aspect ratio,
++    // cropping the overflow on the shorter axis (no distortion).
++    if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
++        uint64_t(surface_height_in_paint_connection_) * properties.display_aspect_ratio_x) {
++      // The window is wider than the source - fill the width, crop along Y.
++      output_width = surface_width_in_paint_connection_;
++      output_height = rescale_unsigned(surface_width_in_paint_connection_,
++                                       properties.display_aspect_ratio_y,
++                                       properties.display_aspect_ratio_x);
++    } else {
++      // The window is taller than the source - fill the height, crop along X.
++      output_height = surface_height_in_paint_connection_;
++      output_width = rescale_unsigned(surface_height_in_paint_connection_,
++                                      properties.display_aspect_ratio_x,
++                                      properties.display_aspect_ratio_y);
++    }
++    flow.output_x = (int32_t(surface_width_in_paint_connection_) - int32_t(output_width)) / 2;
++    flow.output_y = (int32_t(surface_height_in_paint_connection_) - int32_t(output_height)) / 2;
++  } else if (uint64_t(surface_width_in_paint_connection_) * properties.display_aspect_ratio_y >
+       uint64_t(surface_height_in_paint_connection_) * properties.display_aspect_ratio_x) {
+     // The window is wider that the source - crop along Y to preserve the aspect
+     // ratio while stretching throughout the entire surface's width, then limit
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
 index b94fe9e..8e5f781 100644
 --- a/src/ui/rex_app.cpp
@@ -2129,99 +2202,9 @@ index b94fe9e..8e5f781 100644
          if (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_)
            return true;
          return !imgui_drawer_->GetIO().WantCaptureMouse;
-diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
-index dd321a5..a1f731e 100644
---- a/src/graphics/d3d12/render_target_cache.cpp
-+++ b/src/graphics/d3d12/render_target_cache.cpp
-@@ -3798,6 +3798,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
-     const std::vector<Transfer>* render_target_transfers,
-     const uint64_t* render_target_resolve_clear_values,
-     const Transfer::Rectangle* resolve_clear_rectangle) {
-+  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeRenderTargetTransfer);
-   assert_true(GetPath() == Path::kHostRenderTargets);
- 
-   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
-index a5c97a0..8b2ec69 100644
---- a/src/graphics/d3d12/shared_memory.cpp
-+++ b/src/graphics/d3d12/shared_memory.cpp
-@@ -303,9 +303,12 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
- 
- bool D3D12SharedMemory::UploadRanges(
-     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
-+  D3D12CommandProcessor::GpuTimeScope gpu_time_scope(command_processor_, D3D12CommandProcessor::kGpuTimeUpload);
-   if (upload_page_ranges.empty()) {
-     return true;
-   }
-+  ++command_processor_.gpu_count_uploads_;
-+  for (auto& r : upload_page_ranges) command_processor_.gpu_count_upload_bytes_ += uint64_t(r.second) << page_size_log2();
-   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
-   command_processor_.SubmitBarriers();
-   auto& command_list = command_processor_.GetDeferredCommandList();
-diff --git a/src/graphics/pipeline/texture/util.cpp b/src/graphics/pipeline/texture/util.cpp
-index 26d554c..28ddc03 100644
---- a/src/graphics/pipeline/texture/util.cpp
-+++ b/src/graphics/pipeline/texture/util.cpp
-@@ -11,6 +11,7 @@
- 
- #include <algorithm>
- #include <cstring>
-+#include <unordered_map>
- 
- #include <rex/assert.h>
- #include <rex/graphics/pipeline/texture/util.h>
-@@ -199,12 +200,54 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
-   return true;
- }
- 
-+static TextureGuestLayout ComputeGuestTextureLayout(
-+    xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32, uint32_t width_texels,
-+    uint32_t height_texels, uint32_t depth_or_array_size, bool is_tiled, xenos::TextureFormat format,
-+    bool has_packed_levels, bool has_base, uint32_t max_level);
-+
-+// The layout only depends on these parameters, and the same few hundred
-+// textures are looked at on every draw, so results are kept per thread.
- TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
-                                          uint32_t base_pitch_texels_div_32, uint32_t width_texels,
-                                          uint32_t height_texels, uint32_t depth_or_array_size,
-                                          bool is_tiled, xenos::TextureFormat format,
-                                          bool has_packed_levels, bool has_base,
-                                          uint32_t max_level) {
-+  struct Key {
-+    uint64_t a, b;
-+    bool operator==(const Key& o) const { return a == o.a && b == o.b; }
-+  };
-+  struct KeyHash {
-+    size_t operator()(const Key& k) const {
-+      return size_t(k.a * 0x9E3779B97F4A7C15ull ^ (k.b + 0x632BE59BD9B4E019ull + (k.a << 6)));
-+    }
-+  };
-+  thread_local std::unordered_map<Key, TextureGuestLayout, KeyHash> cache;
-+  const Key key{uint64_t(width_texels) | (uint64_t(height_texels) << 24) |
-+                    (uint64_t(uint32_t(dimension) & 0xFF) << 48) |
-+                    (uint64_t(uint32_t(format) & 0xFF) << 56),
-+                uint64_t(base_pitch_texels_div_32) | (uint64_t(depth_or_array_size) << 24) |
-+                    (uint64_t(max_level & 0xFF) << 48) | (uint64_t(is_tiled) << 56) |
-+                    (uint64_t(has_packed_levels) << 57) | (uint64_t(has_base) << 58)};
-+  auto it = cache.find(key);
-+  if (it != cache.end()) {
-+    return it->second;
-+  }
-+  if (cache.size() >= 8192) {
-+    cache.clear();
-+  }
-+  TextureGuestLayout layout =
-+      ComputeGuestTextureLayout(dimension, base_pitch_texels_div_32, width_texels, height_texels,
-+                                depth_or_array_size, is_tiled, format, has_packed_levels, has_base,
-+                                max_level);
-+  cache.emplace(key, layout);
-+  return layout;
-+}
-+
-+static TextureGuestLayout ComputeGuestTextureLayout(
-+    xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32, uint32_t width_texels,
-+    uint32_t height_texels, uint32_t depth_or_array_size, bool is_tiled, xenos::TextureFormat format,
-+    bool has_packed_levels, bool has_base, uint32_t max_level) {
-   TextureGuestLayout layout;
- 
-   if (dimension == xenos::DataDimension::k1D) {
+diff --git a/thirdparty/libmspack b/thirdparty/libmspack
+--- a/thirdparty/libmspack
++++ b/thirdparty/libmspack
+@@ -1 +1 @@
+-Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837
++Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837-dirty
