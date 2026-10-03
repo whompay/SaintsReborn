@@ -26,6 +26,8 @@ class FpsOverlay {
                   rex::ui::Presenter* presenter);
   // Shows or hides the counter. UI thread only.
   void Toggle();
+  // Shows or hides the counter explicitly. UI thread only.
+  void SetVisible(bool visible);
   // True while the counter is shown. UI thread only.
   bool IsVisible() const;
   // Briefly shows "FPS cap: N". UI thread only.
