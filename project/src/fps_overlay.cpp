@@ -455,6 +455,15 @@ void FpsOverlay::Toggle() {
   }
 }
 
+void FpsOverlay::SetVisible(bool visible) {
+  if (!impl_) return;
+  if (visible && !impl_->dialog) {
+    impl_->dialog = std::make_unique<FpsDialog>(impl_->imgui_drawer.get());
+  } else if (!visible) {
+    impl_->dialog.reset();
+  }
+}
+
 void FpsOverlay::ShowNotice(int cap) {
   if (!impl_) return;
   if (!impl_->notice) {
