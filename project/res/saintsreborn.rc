@@ -1,2 +1,0 @@
-// Program icon (Explorer, taskbar and the game window: SDL uses the first icon in the exe)
-1 ICON "SaintsReborn.ico"
