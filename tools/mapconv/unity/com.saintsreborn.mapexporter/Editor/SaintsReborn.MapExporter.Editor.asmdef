@@ -1,7 +1,0 @@
-{
-  "name": "SaintsReborn.MapExporter.Editor",
-  "rootNamespace": "SaintsReborn.MapExporter",
-  "references": ["SaintsReborn.MapExporter"],
-  "includePlatforms": ["Editor"],
-  "autoReferenced": false
-}
