@@ -1,8 +1,0 @@
-{
-  "name": "com.saintsreborn.mapexporter",
-  "version": "0.1.0",
-  "displayName": "Saints Reborn Map Exporter",
-  "description": "Build Saints Reborn multiplayer maps in Unity: place spawn points, weapons and vehicles, then export a ready map pack for the game's maps folder.",
-  "unity": "2022.3",
-  "author": { "name": "whompay" }
-}

@@ -1,9 +1,0 @@
-name = "saints-reborn-gangs"
-main = "worker.js"
-compatibility_date = "2026-09-01"
-workers_dev = true
-
-[[d1_databases]]
-binding = "DB"
-database_name = "saints-reborn-gangs"
-database_id = "092bc03e-9c8e-479e-85b4-785217883fe5"
