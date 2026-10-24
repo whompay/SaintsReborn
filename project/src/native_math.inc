@@ -48,7 +48,7 @@ inline void Mul(u8* b, u32 ra, u32 rb, __m128i out[4]) {
 }
 // Drift guard: the arithmetic is written twice (MulRows here, simde_mm_vmsum4fp128 in the SDK).
 // SelfCheck compares MulRows, bit for bit, with 16 simde_mm_vmsum4fp128 calls in the original's
-// layout (out row i lane l = A row i . B column 3 - l) on 3 fixed matrix products. The results
+// layout (out row i lane l = A row i . B column 3 - l) on 4 fixed matrix products. The results
 // change if either side adds the four products in another order, rounds the products to single
 // precision or rounds a partial sum to single precision. If they differ, Mode() logs an error and
 // the original runs.
@@ -58,13 +58,16 @@ bool SelfCheck() {
     constexpr float rounded_sq = 1 + 0x1p-11f;  // inexact^2 rounded to float
     // matrix[0] * matrix[1]: rows 0-2 . columns 1-3 (ones) cancel and absorb tiny (sum order);
     // row 3 . column 0 = inexact^2 - rounded_sq = 2^-24, 0 with rounded products or partial sums.
-    static const float matrix[4][16] = {  // row-major
+    // matrix[4] * matrix[5]: row 0 . column 0 = (1 + 2^-30) - 1 = 2^-30, 0 with (w + y) rounded.
+    static const float matrix[6][16] = {  // row-major
         {tiny, tiny, -1, 1, -1, tiny, tiny, 1, 1, -1, tiny, tiny, inexact, 1, 0, 0},
         {inexact, 1, 1, 1, -rounded_sq, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1},
         {3, -big, 0x1p-20f, 7, big, 1.5f, -big, 0x1p-30f, -2, 0.1f, 5, -0.3f, 0x1p60f, -1, 0x1p-40f, 1},
         {0.5f, 1e-7f, -3, big, 2, -0x1p30f, 0x1p30f, 1, -1e5f, 7, 0x1p-12f, 1, 1, 0x1p-40f, -1, 0x1p20f},
+        {0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0x1p-30f, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0},
     };
-    static const int pairs[3][2] = {{0, 1}, {2, 3}, {3, 2}};  // A, B
+    static const int pairs[4][2] = {{0, 1}, {2, 3}, {3, 2}, {4, 5}};  // A, B
     const unsigned csr = _mm_getcsr();
     _mm_setcsr(0x1F80);  // round to nearest, no flush, as when the compiler folds constants
     bool ok = true;
