@@ -118,3 +118,12 @@ starts the game.
   are served from a RAM cache (budget set with `ram_cache_mb.txt`).
 - **Frame pacing.** Guest vertical blanks can follow the frame rate cap, so
   frame caps above 60 work with the 60 FPS mod.
+- **Dot products.** The code generator emitted the VMX dot products
+  (`vmsum3fp128`, `vmsum4fp128`) as `simde_mm_dp_ps`, which rounds every product
+  and partial sum to single precision. They now multiply in double, add in
+  double and round to single precision once, which is closer to the console
+  (Xenia Canary does the same). Without this, thin background geometry in the
+  opening cutscene (a ledge under a window, a phone booth) blinks on random
+  frames. The native matrix multiply and shadow-volume builder
+  (`native_math.inc`, `native_shadow.inc`) use the same arithmetic, bit for bit
+  except the payload or sign of a NaN result.

@@ -18,6 +18,7 @@
 // thread run the original, then the native version on the same input, compare the output
 // region, keep the original's result; log "NATIVE SHADOW VERIFY".
 #include <immintrin.h>
+#include <rex/ppc/intrinsics.h>
 namespace native_shadow {
 using u8 = uint8_t; using u16 = uint16_t; using u32 = uint32_t; using u64 = uint64_t; using s16 = int16_t; using s32 = int32_t; using s64 = int64_t;
 inline u8* G(u8* b, u32 a) { return b + a + REX_PHYS_HOST_OFFSET(a); }
@@ -168,7 +169,8 @@ bool Run(PPCContext& ctx, u8* base, bool count) {
                         // Planes == 0 here (the plane-table variant goes to the original).
                         // Lanes as the recompiled lvlx/vrlimi sequence leaves them (16-byte aligned
                         // frame): light-to-vertex vector (x, y, z, f0) in lanes 3..0; vertices
-                        // (x, y, z, -) - lane 0 never reaches the result (dot mask 0xE).
+                        // (x, y, z, -) - lane 0 never reaches the result
+                        // (rex::ppc::simde_mm_vmsum3fp128 takes guest x, y, z).
                         const u32 v3 = u32(s64(stride) * s64(s32(r3))) + vbase;
                         const u32 a7 = u32(s64(stride) * s64(s32(r7))) + vbase;
                         const u32 a8 = u32(s64(stride) * s64(s32(r8))) + vbase;
@@ -207,7 +209,7 @@ bool Run(PPCContext& ctx, u8* base, bool count) {
                         const __m128 c1 = _mm_castsi128_ps(_mm_shuffle_epi32(_mm_castps_si128(e1), 0x78));
                         __m128 nrm = _mm_mul_ps(a, c2);
                         nrm = _mm_xor_ps(_mm_sub_ps(_mm_mul_ps(c1, d2), nrm), _mm_castsi128_ps(_mm_set1_epi32(int(0x80000000))));
-                        const double d = double(_mm_cvtss_f32(_mm_dp_ps(v11, nrm, 0xEF)));
+                        const double d = double(_mm_cvtss_f32(rex::ppc::simde_mm_vmsum3fp128(v11, nrm)));
                         u32 c;
                         if (wind != 0) c = (d < f0) ? 2 : 1;
                         else c = !(d < f0) ? 2 : 1;
