@@ -530,7 +530,7 @@ sets those bytes, H):
   (`825611D8`), 5 parked (`8241E378`), 6 special (`824224F0`), 7 scripts and cheats, 3 co-op's own copies
   (`making_car`; the MP's creators don't run in story mode) and 9 the El Train (`8242D248` under the train manager
   `8242EFB0`), which is left out and counted (trains as records are later). Cars a script makes during a mission are
-  left out too (each game's mission makes its own).
+  left out too (each game's mission makes its own; 2.4's experimental `mission_cars = 1` streams them, section 2.4).
 - people: `8247A6D0(human, -, park)` after the call. It is the activation (H): the human goes on the active list
   `0x8309ABB8` (+3592/+3596) when `+200` bits 0 and 1 are set, else (r5 = 1) on the inactive list `0x8309ABB0`. It is
   called by the constructor `82477B78` (only when `+216` 0x4000 says the model is set up, else `8247A8E0` parks the
@@ -1600,7 +1600,7 @@ written; research tools/coop_test/TEST-2.3.1-findings.md).
   ended as a skip, and the success screen showed on both. After the pass, the host's mission flag kept coming back
   during its end sequence, and co-op started VK01 on the joiner again each time ("didn't start here (trying again)",
   busy 1). The joiner was left in a half-started mission of its own, its title cut off at the top. A mission the host
-  passed is now over on the joiner until the host's mission hash changes.
+  passed is now over on the joiner until the host's mission hash changes (2.4: or the session ends).
 - 2.3.8: the 2.3.7 test hung at VK01's opening cutscene end again, in 824C4850's second wait: the mission group's
   vehicle list *0x8370F8D4 (+84 a vehicle handle, its model **(car+50324)). Its record had handle 0: the mission's car
   didn't exist on the joiner, so nothing could ever load for it. 2.3.6 got through because its car was there. On the
@@ -1614,5 +1614,1678 @@ written; research tools/coop_test/TEST-2.3.1-findings.md).
   - The host's shots that the fire gate refused 5 times in a row get the shooter's state applied again, once a second
     (268 were refused in VK01's last 30 s), with the state logged.
 
+**2.4: people, players, world, missions, network and performance** (the 2.3.9 tests, 2-6 players; research
+notes/coop-2.3/stances_fix.md, items_freeze.md, npc_copy_flicker.md, flinch_audit.md, shells_gangs_time.md,
+shared_world_gaps.md, mission_objective_sync.md, mission_cars.md). The protocol stays 9: every new message kind below
+is ignored by older builds. The mission loading-screen and cutscene-end fixes are 2.3.1-2.3.9 above.
+
+*People (the copies of the host's people on a member)*
+- **Crouching** (always on). A copy's own combat AI (820CC008) crouched and stood it by its own target (820CADC0
+  "crouch here?", then crouch_start / crouch_stop), and MatchCrouch put the host's back 250 ms later: the copy bobbed
+  up and down.
+  - 820CADC0 now answers with the host's crouch for a copy, shown once it has held 200 ms.
+  - The AI's crouch_stop (82462108 from 820CBF8C) is refused while the host's person crouches, and so is the stance
+    restart its caller 820CBEE0 makes right after it whatever the stop did (82440200(h, -1, -1, 1), LR 820CBFA0), for
+    that copy only (each crouch_stop clears the refused copy first, so only the restart straight after it is skipped).
+  - MatchCrouch re-picks only when the bit really changed: a crouch_start the game refused (82461E60: +508 2, +516 4,
+    burning) was re-picked every 250 ms. A refusal waits 1 s and is logged.
+- **Stances** (`stances = 1`, off by default). The stance picker hook (8244E018, 2.2.18) forced every stance on a copy,
+  the walk, run and strafe loops too, while co-op moved the body: the legs looped on the spot. Now only still
+  postures are shown (stand 0-3, crouch 4, ready 62-67, 97, 102, 125, 141), only while the copy stands still and its
+  crouch matches, once per change that held 150 ms, at most every 500 ms. Still is below 0.3 m/s (moving again above
+  0.6 m/s) for 300 ms, from the shown path and the copy's gap to it: the record's velocity was never read for people,
+  so every copy counted as still. The probe from 820CADC0 is skipped, and the copy's AI "ready" re-pick (820D7A78
+  from 820CC008, which restarts the stance every tick while the forced posture has no ready flag: crouched copies
+  flickered) is skipped while the host's posture is forced.
+- **Legs** (always on): a copy co-op holds in place (an action of the host's, or standing on its spot) shows a posture
+  instead of the walk, strafe or back loop its own AI picks; a copy within 1 m of its path stops where it stands
+  instead of stepping back to a path point behind it.
+- **Facing**: a standing copy turns as the host's person turns (it kept the facing it stopped with), past 20 degrees,
+  at 270 degrees a second by the update's time, until within 3 degrees. That turn is the only writer of a standing
+  copy's facing (F6 below).
+- **Flinching** (flinch_audit.md, F1-F6). Every writer of a shown character was listed; the flinches came from the
+  follow path going backwards, two writers in one frame, and whole-gap jumps:
+  - F1, the path never steps back. Past 300 ms beyond the newest record a copy stands at the extrapolated point
+    (150 ms on, only while the last two records moved) instead of jumping back to the record. The jitter buffer also
+    covers the sender's send interval (the 80th percentile of the last 16 gaps plus half the latency spread,
+    `Follower::Add`), up to a cap: people 600 ms, cars 400, players' characters 300 (people past 50 m came at 2-10 Hz
+    against a 130 ms buffer). It shrinks by a quarter of the excess (2-8 ms a record), so a person that comes close
+    isn't 600 ms late for ~12 s. The held people's events wait up to the same cap. (The host-side 10 Hz floor for
+    moving people was left out: the buffer covers the slow bands without a host change.)
+  - F2: a fading person is stopped where it stands when the fade starts (its last move order aimed 0.8 s on), and the
+    per-frame snap keeps it on its path's last point while it fades.
+  - F3: 0.3-6 m off its path a character moves at most 0.35 m an update toward it (about 20 m/s), not the whole gap at
+    once (hold releases, car exits, stop overshoots, get-ups); past 6 m it is placed as before. The per-frame snaps
+    (people and players' characters) only snap under 0.3 m across, so the two agree.
+  - F4: another player's character is left alone by the per-frame snap while getting in or out of a car
+    (`car_anim_until`, as `Drive` already did).
+  - F5: a copy lying or getting up (+780, state 8) is left to its ragdoll and get-up, held 300 ms past it (at most
+    8 s): after the 3 s knockdown hold it was yanked upright onto the path.
+  - F6: the per-frame snap puts a standing copy's position only (5 cm a frame when 0.3-2 m off).
+  - Weapon actions (126-158 and the reloads 164-171) keep the body pinned to the path; every other hold (idle
+    replays, falls, hit reactions, lying) lets it go, and a hold that runs out clears it.
+
+- **The host's people that never loaded here** (the shared model budget; research notes/coop-2.3/
+  shared_model_budget.md). In the 2.4 test 10 of 95 `World match` windows showed fewer people than the host listed (22
+  "Copy never finished loading" in 16 min): a member asks for every copy's model at level 0 of the people group's 12
+  slots, and its level 0 had 6-8 while 4-6 slots stayed free at levels its own game reserves and never used. Co-op's
+  quota (2.2, `PeopleQuota`) never held: 8241BE28 rebuilds the table 0x827ACFFC on *every* world update (824131F0,
+  called by 821FFAF0 with no gate, runs 8241BE28 then 8241CA80), so co-op's write lasted one frame (1424 "applied now:
+  no" against 19 "yes" across every log).
+  - Member: co-op's table now goes on in the existing hook on 8241BE28 (`QuotaHook` -> `QuotaAfterRebuild`) straight
+    after each rebuild, outside cutscenes and the 20 s after one (memory only: the 14 words, which 8241CA80 then copies
+    into the group as the game's own). A level with requests in its queue keeps the game's slots, at least its kind-5
+    count (`PeopleQuota`, once a second) and 1; a level idle for 10 s gives its slots to level 0. Level 0 goes from 6-8
+    to 10-12. `PeopleQuota` no longer writes the table; it turns the grant on and off and puts the game's own table
+    back (with 8241BD40(0,0,0)) when the member stops showing the host's people. While the people group's pass runs
+    the table goes back at once (memory only) and the two game calls follow on the next second's try.
+  - Cutscenes (member and host): while 0x8370D991 is set 8241BE28 returns early and keeps the last frame's table,
+    co-op's when it changed it. On the first such frame `QuotaHook` writes the game's own table from that rebuild back
+    (memory only, when co-op's last write is still in place; 8241CA80 copies it next as the game's own), so a
+    cutscene and its end's wait (821F9700 -> 824C4850) run with the game's slots, the host's parked ones included.
+    The `People-model slot quota` and `Model budget (host)` lines count these put-backs.
+  - Host (`model_budget = 1`): each member in its area reports its room for the host's people every 2 s
+    (kEventModelRoom, 44: its level-0 quota less the level-0 slots bound to models neither the host has nor a copy
+    waits for, its waiting and loaded counts). While a member waited for a model in the last 10 s and the host holds
+    more people models than that member's room, the host parks R = slots - the least room (at most 3) at level 13,
+    which nothing asks at on the host, so its game loads at most 12 - R people models. Up at once (at most once per
+    10 s), down a step after 30 s, off at once when no member in its area has a report under 6 s old. Never while the
+    host's own game waits at a level (more queued than its quota), never below 6 slots at level 0, nothing in a
+    cutscene and 20 s after one (and off at the host's cutscene start), and only while the host's budget tick ran in
+    the last 3 s (it stops while the host's player isn't one). A member counts as waiting only for models the host
+    has or a copy wants (not its own mission characters or player bodies), and for each person it declined for its
+    model since its last report (those never ask, so before, a member short of slots reported waiting 0 and the host
+    never parked: the Mac-hosted test of 65830004); the host counts its people models without
+    the players' bodies. An older host drops kind 44; an older member sends nothing and counts as unknown (nothing
+    parked for it).
+  - The member's admission (`WorldModelRoom`) uses that live level-0 quota less its level-0 slots held by player bodies
+    and its own people (as the room report counts them; 4-11) instead of a fixed 11, so a person
+    whose model can't fit is declined (the host holds the id back 3-30 s) instead of made, waited for 8 s and
+    destroyed after 20. Every copy that doesn't finish loading is counted on the `World (member ...)` line ("never
+    loaded", not only the first 25 lines).
+
+*Players*
+- **Name tags** (`name_tags`, `name_tag_m`): each other player's name over their character, drawn the way multiplayer
+  draws its overhead info (8237DF20; MP's own pass 8237F4A0 runs only through the net-mode slot *0x8370F230 from the
+  2D HUD pass 82200700 with the MP byte set). The frustum test 82632A00 and world-to-screen 82632178 at 2.15 m over
+  the feet (in a car 1.4 m over it plus 0.35 m a seat, one line per seat); the text measure 8264EF48, then 8264E988
+  twice (px_thinoutline *0x827D6D20, then px_thin *0x827D6D1C) at HUD scale x 0.87; the slot's map-arrow colour,
+  faded over the last 30 m and at half alpha while the player is down. Drawn from a hook on the story HUD 822E1508,
+  so they go with the HUD and its fade (822E3C10). Names are folded to printable ASCII (the font's coverage beyond it
+  is unknown).
+- **The host's freeze in the first 4-player session**: co-op played a player's exit from the host's car (8257B8E0,
+  which reserves the seat: car+52360+seat*108); 630 ms into it their knockdown took them out at once with
+  8257C400(h, 19). That leaves the reservation and the door seat +2508 that the exit's end (82576A60) would clear.
+  Once they got up, the car's per-seat update (82531138 -> 82528338 -> 824482F8) looked up the seat pose of that
+  reservation through their car, now 0, and 82542FC8 walked guest memory from 0x3F8 until it crashed. Now
+  `LeaveCarNow` does event 19 plus those two clears at all four event-19 places, and a hook on 824482F8 skips the
+  lookup for a person with no car (its no-car path, the byte *0x8370F832 set, always runs). Both are counted on the
+  `Seats:` line.
+- **Clothing that doesn't stay on**: the host's other freezes in the 5-player sessions were the game's own render bug
+  in 822335E8, the sibling of 822366B8 (a player-type character's per-piece render instance returns 0 still holding
+  its lock at +364 when the "dupe anim shadows" pool allocation fails); the renderer fix (render_fixes.cpp, #42)
+  guards both. On the co-op side a re-dress of another player's clothing that doesn't stick (pieces unloaded again
+  every ~3 s all session for 3 of 4 players) backs off: from the second within 10 s the next waits 10 s, doubling to
+  60 s, counted from the later of the last re-dress and the end of the last wait. A real record or count change is
+  still dressed at once.
+
+*World*
+- **Props** (`props = 1`, now on by default, also when the line is missing): no freeze or NaN with it in the 2.4
+  runs; its 2.2.20 freeze was the item copies (below).
+- **Dropped items** (`items = 1`, now on by default). Copies were made with -1.0 at +60 and 0 at +64; the game's own
+  drops (824739D8, 82408B78) put the item collision filter *0x827E79EC at +60 and -1.0 at +64 (the mass from the
+  items_3d entry). The copies were bodies of mass 0 with filter BF800000, the likely source of the NaN that froze the
+  joiner in 2.2.20-2.2.24 (the hang itself was 8240FBB0's angle loop, "while a >= pi", on a NaN camera forward). Now:
+  - copies use the game's two values, and are checked for a NaN in every row and in their height;
+  - the people pass (8240FBB0) is skipped while the camera's forward is NaN (logged);
+  - the gun drop 824739D8 is hooked again with the game's own drop always run (the 2.2.19 way, taking the gun with
+    82446038, was the 2.2.24 freeze suspect). For a copy of the host's people on a member the new gun item (new in the
+    item ring, the gun touch handler 82405F98) is removed on the next update, so only the host's item copy shows.
+    Counted on the `Dropped items:` line.
+- **Corpses** (`corpses = 1`): a hook on the corpse clean-up 824793C0 skips it for a dead copy shown here (made, not
+  fading) past its gate, so the body stays until the host's remove fades it; before, the member's clean-up took
+  bodies while the host's still lay there. Nothing of the copy is touched. A game loop waiting for it (4 asks for the
+  same copy within one game update, counted per copy so two copies asked in turn are caught too; the normal call is
+  once per update) is let through. A copy kept 10 minutes is let through too, so it can't stay on when no remove
+  comes (a body hidden on the host): past the gate the clean-up hides it at once (+120 0x08000000, +3664 set 10 or
+  15 minutes on for a later step) or, with neither +3619 bit, destroys it (then reported as gone, as with
+  `corpses = 0`).
+- **Weather blend**: the clock was already the host's, but the joiner held the host's stage pure while the host's sky
+  was a blend of two (82157598 blends forecast entry i with i-1 in the first half of its duration and with i+1 in the
+  second). A new event, kEventWeatherState (41), every 2 s and on a change (the stages, or the half), carries the
+  host's previous / current / next stages, their durations and the time into the current entry. The joiner releases
+  its hold and writes the two entries being blended with the host's durations and starts (only 2, the count the
+  game's own forced path writes: the forecast array's size couldn't be confirmed from the code), so its own updater
+  makes the host's blend. While the host holds its weather (a cheat or a menu) kind 41 sends the held stage
+  (*0x8370D204) and the joiner holds the same. Kind 35 still goes for older builds and counts only without a kind 41
+  in the last 30 s; both kinds' state is reset when the session ends. Counted on the `Weather and waypoints:` line.
+- **The gang response for a wanted member**: the joiner had 5 stars with the Vice Kings and only police came. The
+  host's people model quota (8241BE28, table 0x827ACFFC) is built from the host's player alone, so the member's gang
+  got no model slots and its response group (823FD1B8: all its models loaded) was never eligible. A hook on 8241BE28
+  runs it for the response's target (`PlayerSwap`) while that member's gang level is 2 or more and above every one of
+  the host's. The host's `Police:` line counts the rebuilds and the steered orders per group (police, helicopter, the
+  three gangs); the first 30 orders are logged (was 10).
+- **Brass**: co-op never touches the game's casings (pool 0x837599C4, 64 x 224 B, each freed by 82132FA0 5 s after it
+  is made), yet a tester saw some stay in place on one screen. `BrassCheck` walks the active list once a second and
+  lets one older than 6 s go (its timer set to now: the game frees it the next frame).
+- **Blood** (`hit_effects = 1`; research notes/coop-2.3/hit_effects.md): the other games skip the person hit
+  824581C8 for a replayed shot, so only the shooter saw blood. Its blood is one cosmetic call, 82132BA8(pos, dir,
+  type), from 824581C8 only (0x824586A4 headshot, 0x82458728 body). The game whose 824581C8 really ran (the
+  shooter's; the host for its people's) sends what it played (event 45: the victim, the position from its centre, the
+  direction, the type; at most 30 a second), and each other game plays 82132BA8 alone on its copy, held with the
+  shot's follow delay, and not when its copy stands over 8 m from the shooter's spot. Line `Blood:` every 10 s.
+- **The sync checker** (always on; research notes/coop-2.3/sync_checker.md): the host's truth near each member,
+  compared there, so sync gaps show in the logs instead of by eye.
+  - Host: every 3 s per member in its area (one member a call, at least 250 ms apart), a sample of the 24 registry
+    entries nearest that member's character within 60 m, streaming or not, as its game has them now: position,
+    velocity, heading, stance, crouch, gun, car and seat, dead, how long the person's visible state has held
+    (`WorldObj::t_since`, kept by `WorldRefresh`; not steady when it wasn't looked at in the last 500 ms), what it knows of the offer to that member (created, declined, not
+    offered yet, not streamed and why, the chunk off there, a player's car), and its loose items there (up to 8).
+    A new session message type, kMsgWorldTruth (41, WWT1: `TruthHeader` / `TruthRec` / `TruthItem` in world.h, at
+    most 822 bytes), unreliable and outside the stream's budget (~270 B/s per member). Older members drop the type.
+    Props are in the format but not sampled (each would need a game call).
+  - Member: a sample is held 600 ms, then compared once after an update's applies. A record whose host side doesn't
+    stream it is "host-only" (not a gap). Then, in order: not created (lost create, create pending, declined and why,
+    the host waits on a decline, removed here, chunk off), invisible (queued, fading, not resolvable, its model not
+    loaded, set up pending, hidden, faded), the wrong model (stand-in, other), position at the sample's own time (the
+    copy's shown owner time from its follower, the host's velocity times the difference; 1 m + 10% of the
+    extrapolation, 2 m for a car above 15 m/s, twice without follower data; "stream" when the newest record is off as
+    well, "apply" when only the copy is), facing (30 degrees), the stance by class (still, crouched, crouched moving,
+    upright moving, other: a copy plays its own walk and run variants), crouch, gun, in a car and the seat, dead. The
+    state is judged only once the host's person has held it 1 s ("in transition" otherwise), seated people get no
+    position or facing check, a player's car no facing check, the first 10 s in the area count as "joining" (items
+    told before the member joined come again with the host's 5 s resend). When the host listed everything within
+    its radius a copy within 55 m of the center that isn't in the sample is an "extra" (a ghost): where its records put
+    it at the sample's time, and never a copy created after the sample. Items: missing, gone, more than 1 m off.
+  - Logged: one line per new id and category (again after 30 s; at most 8 a window and 100 a session), the 10 s
+    `World truth:` line, and once at each session's end `World truth (session ...)` with the repeat offenders, and on
+    the host `World truth (owner, session)`. The host's `World (owner) match slot` line counts the samples it sent.
+  - Not built: the two-instance test harness of the research (section 9).
+- Not done: blood and hit effects for replayed shots (824581C8 still skipped under `fire_replay_depth`). Its effects
+  run only after the damage call 82454A30 returns true, which with the replay's damage zeroed isn't known, and the
+  rest of it holds the knockdown 824497F0, the ragdoll impulses (82267DB0 / 82267F28 / 82268500) and unidentified
+  calls (82455CF8, 8237A6F8, 82480348) that may be reactions: letting it run risks double knockdowns. It needs the
+  effect call found first (Option B of the design).
+
+*Missions*
+- **The host's mission markers** (`mission_icons = 1`). In the 2.3.9 test the joiner's own copy of the mission (Los
+  Carnales' Trojan truck, most likely lc04) marked its own truck with the green square; getting in it did nothing for
+  the host's mission, and the 150 m catch-up kept pulling the joiner away from it.
+  - The host sends its mission's map icons (list 4, head *0x83027018: icons 52 `map_act_kill`, 59
+    `map_act_location`, 66 `map_act_protectacquire`, with their positions from 822EE5E8) as a new HUD kind,
+    kHudMapIcons (6): every 250 ms when they change, every 2 s anyway, and once empty at the mission's end. The icon
+    name table (0x82038DF8) is checked once: with other names at those indices nothing is sent.
+  - The joiner shows them as the game's own icon nodes (822EC550, kind 6 with a fake handle 0x7EC00000 | slot); a hook
+    on 822EE5E8 answers their positions, so the game draws them on both maps with its variants, glow and edge. A
+    person's or a vehicle's marker follows the copy of the host's person or car here every update, so their moves
+    don't count as a change on the host (a fleeing target sent the reliable snapshot at 4 Hz) - only while that
+    person or car streams to every other player (each in the host's area with the copy made). Without a copy on
+    every joiner (a mission vehicle with `mission_cars = 0`, a named story character, a joiner out of the area) the
+    moves count as before, so the marker still moves at 4 Hz there.
+  - While it runs the host's mission and the host sends them, the joiner's own `ingame_effect_add_vehicle` (824CF230,
+    the green 3D car marker) is skipped. Its own `minimap_icon_add_*` (824D1EC0, 824D1FA0, 824D2088, 824D2168,
+    824D2228, 824D2308) run, and the next update removes its own icons of the three kinds the host sends (a trigger's
+    with its +372 / +364), as it does once at the start for those added before. Any other icon a mission step adds
+    stays: the host doesn't send it, and skipping every add left that step with no marker at all.
+  - Vehicle and location steps still count only for the host's player: the joiner follows the host's markers and
+    helps (kills already count). The 3D location markers, the GPS route and the pause menu's objective list are still
+    the joiner's own.
+- **Following the host** (`mission_follow_m`, `mission_cutscene_follow_m`): the catch-up by distance is now
+  `mission_follow_m` (0 = never, the default; 100-2000; 2.3.9 brought a joiner over 150 m away every 10 s, away from
+  what it was doing). After the host's cutscenes (which move the host with teleport("#PLAYER#")) the joiner is moved
+  only past `mission_cutscene_follow_m` (40 m). The pull at the mission's start and on the host's scripted jumps
+  stays. The mark of a mission the host passed (2.3.7) is cleared when the session ends, so a next session can play
+  it again.
+- **The host's mission vehicles** (`mission_cars = 1`, experimental, off by default). Each game runs its own copy of
+  the host's mission, so each makes its own mission vehicles, and the host's were left out of the world stream: in
+  lc04 the joiner had its own truck, and the host's (the one its mission counts) wasn't shown. With it on both sides:
+  - Host: the cars a script makes during its mission (source 7, `world_mission_cars`) stream like any script car (not
+    while its script has one hidden: lc04's truck until its step), but only with `traffic = shared` on the host and
+    while every member in its area has said within 10 s that it hides its own (kEventMissionCarsOn, 42, member ->
+    host every 2 s). A member with 0 or an older build never says it, and the cars stay left out for everyone as
+    before (one a member already has is removed there after kInactiveMs). Once they stream in a mission they go on
+    streaming while a player sits in one of them, whoever comes into the area or acks late (left out under a member
+    at the wheel of the host's truck, that member would get two trucks). Once a second the host lists them
+    (kEventMissionCars, 43: up to 7 ids an event, a flag for "streaming").
+  - Member: its own mission's vehicles (source 7 made while its mission runs, and the vehicle records of its mission
+    groups, *0x8370F8D4 +84) are paired with the host's listed ones of the same model, nearest first, and hidden the
+    way `vehicle_hide` does (82538A90(handle, 1)). They are not destroyed and the records aren't rebound: the joiner's
+    script and the group waits (824C4850, GroupWaitHook) keep a live car under each record, and the joiner's script
+    never drives, teleports, locks or removes the host's copy. One its script shows again is hidden again; one a
+    player sits in, or with a shown driver, is shown and let go (an NPC-driven mission car stays the joiner's own;
+    a driver shown during a cutscene and 1 s after doesn't count, as the mirror shows the joiner's hidden mission
+    characters for every cutscene); one its script had hidden is left alone.
+  - The host's copy not shown here for 3 s while the host still lists it (out of the area, declined): the own one is
+    shown again. No longer listed (wrecked and removed there, or hidden there by its script): it stays hidden while
+    it isn't listed, and the pair goes on as before when it is listed again (a late list doesn't end it). Mirror
+    over, no "streaming" list for 4 s, or the session over (the link lost, the host gone): everything hidden is shown
+    again (`vehicle_show`: 82538A90(handle, 0), 825321F8) and the mission-car lists start over.
+  - Getting in the host's truck works as for any world car; whether the host's mission counts the joiner at its
+    wheel is the host script's own check (it asks for its own player).
+
+*Network*
+- **Epic, a player who is gone**: in the first 4-player session (online, one player through Epic's relays) a player
+  whose game stopped answering filled the shared send queue (capped at 64 KB, kOutgoingQueueBytes); the others'
+  packets were refused (1190 in 10 s) and one of them dropped too. When the host drops a player (timed out, too far
+  behind, left), co-op now clears what is queued for them and closes their Epic connection (EOS_P2P_ClearPacketQueue,
+  EOS_P2P_CloseConnection; net.h `Session::OnDrop`). Not for "joined again", whose new join uses the same connection.
+
+*Performance with more players* (the 2.3.9 group tests: co-op's game-thread time was 21-30 ms/s at 4 players and
+83-113 ms/s at 6, with single updates of 492-738 ms; the parts that grew were `avatar`, 3.6-4.4 ms/s to 59-75, and
+on a member `world apply`, 2.5-3.5 to 35-45)
+- The re-dress back-off above: its streak was counted from the last re-dress, so the first 10 s wait always ended it
+  (3 re-dresses every 16 s for good). Each cycle cost ~35 ms; at one every 3 s that was ~12 ms/s per such player.
+- One heavy character step per update for all the other players together: a character made, its first dressing,
+  each of the three steps of dressing again, and a colour rebuild. The 300 ms gate covered only the first two, and a
+  first dressing ran in the update its character was made in (the 492 ms update: made in 400 ms, dressed in 86). The
+  first dressing now comes in the next update, still without the 300 ms wait. A step the game refuses at once
+  doesn't take the turn.
+- World copies far from this player (cars past 100 m, people past 60 m) are steered every other update, half of them
+  each time: a car's velocities (`WorldSteerCar`) and a person's `Drive` (the teleport 8243E6F8 and the move orders).
+  A car keeps the velocity it was given meanwhile (its impact check and velocity hold go at that half rate too) and
+  the per-frame snap still keeps people on their paths; everything else about a copy runs every update. In the 6-player test `world apply` followed the cars steered, and
+  most copies were past 50 m. The `World (member) applied:` line counts the updates skipped.
+- The cars players sit in are taken once per pass (each car copy looked up every player's character and car); the
+  other players' look blocks are compared in place and their colours copied only when they go on.
+- The Perf line names the worst update's cause: its biggest part, the biggest part inside that while it holds over
+  half, and the heaviest character step, e.g. `(worst 492.3 ms: avatar 491.0 > avatar: made 400.2 (Player 4:
+  character made 400.1))`. New parts: `avatar: made`, `avatar: clothing`, and `world apply: messages`, `: creates`,
+  `: removes`, `: cars`, `: people`. `Perf parts` lists 12.
+- Left: making a character in a pool slot released moments before took 400 ms inside the game's respawn (8247E248),
+  and a first dressing waits for the clothing to load (8248CFC8: 86 ms of that 492 ms update). Each is now alone in
+  its update; a first dressing without the wait (the re-dress path's) would remove the second.
+
+*Settings* (mod.ini; with its line missing a setting takes the default)
+- `name_tags = 1`, `name_tag_m = 150` (10-1000).
+- `props = 1`, `items = 1`, `corpses = 1` (on); `stances = 0` (off: crouching and the legs fix run either way).
+- `mission_icons = 1`, `mission_follow_m = 0` (never by distance), `mission_cutscene_follow_m = 40` (6-2000),
+  `mission_cars = 0` (experimental; needed on the host and every member in its area, and `traffic = shared` on the
+  host).
+- `model_budget = 1` (the host: 0 = it never parks slots for the members' room).
+- `hit_effects = 1` (0: no blood sent or played for other games' hits).
+- Always logged, whatever `diagnostics` says: `World truth:` (members, every 10 s while samples come) and its session
+  lines, `People-model slot quota (after the game's rebuild):` (members) and `Model budget (host):`.
+- `diagnostics = 0`. With 1, the extra 10 s status lines for tracking sync problems are logged - `Legs (member):`,
+  `Flinch:`, `Crouch (member):`, `Corpses (member):`, `Brass:`, `Mission icons:`, `Mission cars (host):` / `(member):`
+  and `Name tags:` - with the first detail lines behind them (ready re-picks skipped, casings let go, the weather
+  blend written, the icon snapshots, own mission markers removed after their add, own mission vehicles hidden). The
+  counters run either way; one-off lines (settings checks, the first tag, refusals, errors) are always logged.
+
 Not built yet: Package B/2-6 (personal cars as records, occupant events, the pose relay filter); Package C's later
 parts (wreck looks without physics, props and movers as records, pickups; drive-by mode and the aim pose on copies).
+
+## 12. Co-op 3: one shared world, no world host
+
+Goal (the user's): every player is always in the same world, wherever they are, as in GTA Online: each game
+simulates the people and cars around its own player and shows everyone else's, and objects change hands in place as
+players move. In 2.2-2.4 the host owns one area around its player and a client runs its own world outside it, which
+nobody else sees. Co-op 3 gives every game a world of its own to stream, keeps a session host for the lobby, the clock
+and the weather, and hands objects over in place. It is built in phases, each with its switch (`world_mode = area`
+keeps 2.4's world): 1a the multi-owner wire and names, 1b 2.1's streams removed, 2 every game owns (no areas), 3 the
+hand-over in place, 4 host migration (built), 5 direct links. Research: notes/coop-3 (DESIGN.md, its section 12 overriding,
+host_assumptions_audit.md, review_design.md).
+
+**Phase 1a: owners and names on the wire, protocol 10** (no change in play: the host is still the only world owner).
+- *Protocol 10.* `net.h` `kVersion` 10: 2.4 (9) and older builds are refused at join, as every version change.
+- *NetId.* An object's name for its whole life, whoever owns it: (origin slot, origin handle, origin join nonce), in
+  `world.h` packed origin << 56 | handle << 16 | nonce (map order is the origin's handle order, so `Plan` runs in the
+  same order as in 2.x). It is not a handle: each game holds the object by its own (`Entry.local`, the copy's
+  `local`). The join nonce (`world_nonce`) is a new one each time a game's registry turns on (a session start, a new
+  slot; never the last one, never 0), so a slot that joins again, or a handle a later session uses again, names
+  another object. Nothing names an object before its create, so the creates carry it and the join itself is as in
+  2.x.
+- *Registry.* Keyed by NetId and found by this game's handle too (`Find(local)`, `FindNet`, `FindOrigin` by origin
+  and handle alone); `Entry` has `net`, `local` (was `id`), `owner` and an ownership `epoch` (0 in 1a; +1 a hand-over in
+  phase 3) as fields instead of the key's owner / id. The scheduler's plans and removals still name records (owner,
+  local): every record (`WWS1`, `WWR1`, `WWD1`, `WWT1`, crews, seats, `kEventAuthority`) names an object by its owner's
+  handle in the owner's namespace.
+- *Wire.* `WWC1` 49 bytes: + the owner, the NetId's origin, nonce and origin handle, and the ownership epoch (`id` is
+  the owner's handle, the records' name; 1a: origin == owner, handle == id). `WWR1` 18 bytes: + the owner and the
+  epoch it went at (a remove from before a copy's last hand-over is dropped). `WWA1` 27 bytes: + the owner it is for
+  (its target; its declined ids are that owner's handles).
+- *Members keyed by owner.* The member takes a world message only from the owner it names: `WWC1` / `WWR1` / `WWS1` /
+  `WWD1` / `WWT1` whose owner is not the slot that sent it are malformed (`WorldIn` keeps the origin), and the
+  OwnerMap only from the session host. Copies are keyed (owner, its handle) from the record and carry the create's
+  NetId and epoch; the digest is per owner (`world_digest[owner]`); `WorldOnMap` is in another game's area when its row
+  names an owner that isn't this game (was: owner 0), and keeps that owner (`world_area.owner`, `WorldAreaOwner()`):
+  `WWA1` and the model room go to it, the sync checker takes its truth only, the members' lines name it. The lookups
+  `WorldPersonLocal` / `WorldCarLocal` / `SharedPedLocalHandle` / `SharedCarLocal` / `FindCar` take the owner (2.1's
+  copies and taken cars are the session host's).
+- *Persons in events by NetId.* A person goes by its NetId's handle in the word that held the host's handle, and a tag:
+  the full one (origin << 28 | epoch & 0xFFF << 16 | nonce) where a word is free, else the short one (origin << 12 |
+  epoch, the full tag's top half, matched without the nonce) in the top half of a word that had 16 bits left. The
+  person an event is about is taken from its owner (the event's origin) at its epoch; one named as an argument (an
+  attacker, a call's pointer) by its origin and handle. "The host's player" is the sender's. The layouts:
+  `kEventPedAction` a[4] handle, a[5] full tag; `kEventPedCall` a[1] handle, a[7] short tag << 16, a kind-4 argument's
+  origin in a[6] bits 12 + 4i; `kEventPedReact` a[0] handle, a[1] kind | the kind-4 attacker's origin << 4 | short tag
+  << 16; `kEventPedEffect` a[0] handle, a[5] full tag; `kEventPedStyle` a[0] handle, a[3] full tag; `kEventHitFx` kind
+  2: a[0] handle, a[1] short tag << 16; `kEventPedDamage` and `kEventPlayerHitByPed` a[0] handle, a[7] short tag << 16.
+  A hit on a copy goes to its owner (`kEventPedDamage`, was slot 0) and a member's bullet on a car copy to the car's
+  owner (`kEventCarDamage`); the owner takes a hit at any epoch. `kEventAuthority` only from the car's owner,
+  `kEventExplosion` only with the sender's own slot as its owner, and its people and cars by that owner's ids.
+  `kEventCrewDamage` (2.1's traffic) goes to the session host; it goes with 2.1's streams in 1b. `kEventHostModels`
+  stays.
+- *Roles.* `SessionHost()` (the slot: 0 until host migration) and `IsSessionHost()` for the clock, the weather, the
+  pause, the OwnerMap, the 10 Hz mission state and "lost the host"; `OwnsWorld()` / `WorldOwnerSlot(slot)` for the
+  world stream (the owner tick, `WorldSends`, the person events, hits, the members' gates, Package B's spawns). In
+  `world_mode = area` both are the session host. Mission, HUD, cutscene and police tests stay `hosting` (the mission
+  host and the police owner come in phase 2).
+- *Tests.* `world_test`: the new fields round trip, NetId packing and order, the tags and the epoch's 12-bit wrap,
+  the registry by NetId / handle / origin, and an owner in slot 2 planning (2, its handle). `net_test`: protocol 9 is
+  refused.
+
+**Puppet copies** (the switch `puppets`, built before 1b: the hand-over needs a copy's brain to go off and on; no wire
+change, member side only). Research: notes/coop-2.3/puppet_copies.md (phases 0-1), notes/coop-3/puppets_notes.md.
+- *Brain off.* `PuppetBrainHook` on the people AI update `820D5B48` returns at once for a puppet, the way SR1's MP
+  client skips it for every NPC (`0x8370E9F6 == 1 && 0x8370E9DF == 0`). No AI mode update runs for it (the combat AI's
+  own fire, crouch, ready re-picks and stand-ups, gun changes, move orders); its animation, locomotion, physics, damage,
+  ragdoll and get-up run as before (outside it in the human update `82441B00`). A puppet is a world copy on foot, made
+  and set up, alive, not lying or getting up, no cutscene, with a stance from its owner in the last second
+  (`PuppetBar`, each update in `WorldApplyPerson`); otherwise it is 2.4's copy for that update. Other players'
+  characters and 2.1's copies are never puppets.
+- *Legs.* The owner's layer 0 state (`PedRec.stance`, +576) is kept with its record's time (`WorldCopy.ps`), and the
+  one at the copy's shown time plays (`PuppetShown`: it comes with its body, not 50-130 ms ahead). `StancePickHook`
+  answers it whatever `held` / `still` say, and `WorldApplyPerson` re-picks a copy whose +576 differs, at most every
+  100 ms (`82440200(h, -1, -1, 1)`: a blend, nothing on the same slot). 2.4's still-posture block is off for puppets;
+  the crouch (`MatchCrouch`), the gun in hand, `sync_idle` and the animation state (+952) are as before. A state the
+  copy's anim set lacks: its own pick, on 2.4's move orders (counted, the first 10 logged).
+- *Body.* Placed only (`Follower::Place`: `Drive`'s sampling, NaN guard and capped catch-up, `MoveHuman` with the
+  path's velocity; no move orders, holds or standing turns); `SmoothWorldPeople` puts it and its facing on the path
+  every frame, through the owner's actions too. While an action plays with the path still it is stepped 5 cm a
+  frame and not placed (placing cut actions short). A move order still running is stopped (`82441308(h, 0, 0)`).
+- *Hooks that go quiet for puppets* (they live in the AI update): `CrouchDecideHook` (820CADC0), `CopyReadyHook`
+  (820D7A78), the stand-up refusals of `CrouchStopHook` and `StanceRestartHook`. They stay for 2.4's copies.
+  `MakePassive` stays (the combat bits matter again whenever a copy is not a puppet).
+- *Never "may despawn"* (whatever `puppets` is). `CopyDespawnHook` on `8244BC40` answers no for a copy (not fading).
+  It is asked only by `8244BCE8`, the deactivation behind the region check, the off-screen cull, the model unload and
+  the area clear: yes there destroyed the person (and a driver's car) before deactivating it. A copy is now only
+  deactivated, as a script person (then `WorldApplyPerson`'s not-set-up case as before). `HumanDestroyHook`'s 60 s
+  refusal stays for the paths that don't ask.
+- *Log* (with `puppets = 1`, or `diagnostics = 1`; every 10 s): `Puppets (member): N of M person copies on foot with
+  the brain off; turned on, off by reason; AI updates skipped; picks answered (own pick kept); re-picks; updates placed
+  / held in an action / on move orders; move orders stopped; shown state = copy's %; +3716 changes; despawn asks
+  answered no`.
+- *Later* (puppet_copies.md phases 2-3, need a `WWP1` message): the aim target (`820D8168`, +3220 / +3224), the ready
+  bit and layers 1-2 from the owner; actions held to the copy's shown time.
+
+**Phase 1b: 2.1's streams removed** (no change in play with `world = 1`, the default since 2.3: the world stream is
+the only way another game's world shows; `kEventHostModels` stays). Research: notes/coop-3/phase1b_notes.md.
+- *Removed (the host's side).* `CaptureTraffic` / `CapturePeds` and their packets (`WTR1` / `WTN1` / `WPD1` / `WPL1`,
+  `kMsgTraffic`, `kMsgTrafficNames`, `kMsgPeds`, `kMsgPedLook`: the four type numbers stay unused, so the later types
+  keep theirs), `WorldLegacyStreams` and `legacy_streams` (which clients still got 2.1's streams), `ClientPositions`,
+  `traffic_out` / `peds_out` / `traffic_names` / `ped_looks_out`, `IsSentCar`, the police response's units and cars
+  sent in them (the response streams as any person and car of the world).
+- *Removed (the client's side).* `shared_cars` / `shared_peds` and everything that made, moved, seated, stood in for,
+  dropped or adopted 2.1's copies (`SharedCar`, `RemoveSharedCar`, `AdoptSharedCar`, `LetGoSharedCar`,
+  `SteerAlongPath`, `StandInSeated`, `DropCopy`, `AdoptOwnCharacter`, `SmoothSharedPeds`, `quick_gone`,
+  `unloadable_models`), `traffic_in` / `peds_in` / `ped_looks_in`, and the 3 s wait before the first OwnerMap
+  (`world_wait_until`: a new session showed 2.1's streams then). `kEventCrewDamage` (23, a hit on a crew of 2.1's
+  traffic by its seat) is gone: a crew is a person of the world stream and is hit with `kEventPedDamage`.
+- *Removed (the setting).* mod.ini `world` (`world = 0`: 2.1's streams, no world stream; `world_stream` in the code)
+  and its log lines. `traffic = own` / `peds = own` keep their meaning for the world stream: on the owner its cars /
+  people are left out of it (`kEntryExcluded`), on a member its own stay on.
+- *Kept as they were, now on the world stream alone.* The levers (`UpdateSharedTraffic` / `UpdateSharedPeds`: this
+  game's own traffic, parked cars, people and gang manager off while it shows another game's area and until its last
+  copy is gone, its own police by `OwnPoliceOff`), the people-model memory (pins, `EvictNonHostModels`,
+  `LoadedLookalike`, `DropOwnModelRefs`, the quota), `kEventHostModels` and its uses (`SendModelRoom`,
+  `LoadedLookalike`, the eviction scores, the drop of own mission characters).
+- *Ported to the world stream.* The predicates name world copies only: `OurCharacter` (`WorldPersonId(h, true)`),
+  `CrewCharacter` (`WorldCrewSeat`), `IsSharedCarHandle` (car copies and world car copies); `SharedPedHostHandle`,
+  `SharedPedLocalHandle`, `SharedCarHostHandle`, `SharedCarLocal`, `IsSentPed`, `NetPerson`, `FindCarToUse` gave way to
+  `WorldPersonId(h, false)`, `WorldPersonLocal`, `WorldCarId`, `WorldCarLocal`, `WorldSends(h, false)`, `WorldPerson`,
+  `FindCar`. `taken_cars` (a world car copy this player took: `WorldLetGoCar`) holds `CarKey(owner, its handle)`, so
+  `CarId`, `FindCar` and `WorldAdoptCar` name it by its owner (it was a bare id of the session host's); `CarId` names a
+  world car copy by `WorldCopyOwner`. `QueuePersonEvent` goes to the area's members only (its "every game" branch was
+  2.1's). The mission icons on the host's people and cars find their copies through the world stream.
+- *Fixes from the 1a review.* `WorldOnRemove` looks the copy up first and drops a remove of an older ownership epoch
+  before it tombstones the key; `WorldOnCreate` drops a create older than the copy it would replace (M1). "No person"
+  is origin 15 (`kNoPersonTag`, `PersonNet`'s default): the person-event senders skip a person no other game knows
+  (`kEventPedAction` / `PedCall` / `PedReact` / `PedEffect` / `PedStyle` / `PedDamage` / `HitFx`; a call's or a
+  reaction's person argument goes as none), and `kEventPlayerHitByPed` still goes with an attacker of origin 15, "not
+  here" there (M2). `NetPersonLocal` takes this game's own person by its bare handle only when the registry has none
+  under that handle (L1); a new join nonce is never the last one, also when the sum wraps to 0 (L2); the default
+  create charges are 10 bytes higher (`kCreateBytesCar` 130, `kCreateBytesPed` 170, WWC1's 49 bytes: L3); the tag
+  packing is named in `world.h` (`ShortBits`, `TagOfShortWord`, `OriginTag`; `ShortTag` is `TagFromShort`) and tested
+  (L4, L5). Style: version tags read "(3.0: ...)", the comments say what a line does (not what it was), `cw::` after
+  its alias, `world_mode_shared`.
+- *Log lines.* Gone: `World (owner): 2.1's traffic and people streams to slot S ...`, `World (member, mod.ini world =
+  0 ...)`, `Shared traffic: N cars (host sent N) ...`, `Traffic people: ...`, `Cars made with a different model than
+  asked`, `Pedestrians not sent ...`, `Mission characters seen ...`, `Cutscene: the host's people hidden here ...` /
+  `Cutscene over: N of the host's people shown again ...`, `Car copy (type T) was removed by this game ...`, `Copy
+  never finished loading: ... (host ...)` with its `its model's streaming` / `stream entry` lines (2.1's copies; the
+  world copies' `(world person ...)` one stays), `Remote vehicle: a player took a car of the host's shown here`,
+  `Pulled-out driver copy carries on as the host's person`, `... hit the crew in seat ...`. Shorter: `World (owner) slot S (where): offered ...` (no "2.1's traffic and people streams to it"),
+  `Shared pedestrians: looks applied, animation sets matched, own removed, actions`, `Copies: hits sent, hits taken
+  from people, own actions blocked`, `Models not loaded here in time: model requests asked again; people refused by a
+  full pool`, `Copies removed: made as kind ...` (no gone / not sent / far), the crews line without its hits on 2.1's
+  crews, the police line without the units and cars sent.
+- *Risk.* With no OwnerMap from the host for 3-10 s (a stall, a load) a member shows its own world until the map comes
+  back; 2.4 showed 2.1's streams then if the host still sent them. The fallback for a broken world stream is the
+  previous build, not `world = 0`.
+
+**Phase 2a: every game owns its world, per-object interest** (`world_mode = shared` only; `area` plays exactly as
+before). Research: notes/coop-3/phase2a_notes.md.
+- *Roles.* In shared mode every game is an owner and a viewer at once: `OwnsWorld()` (this game's registry streams)
+  and `WorldViews()` (this game shows copies of others) are both true, `WorldOwnerSlot(s)` is any other slot, and
+  `WorldTakesFrom(s)` (`from_owner` in the dispatcher and the network thread) takes the world messages and events of
+  every other game. A hook that has to tell a copy from this game's own asks about the object (`WorldPersonId`,
+  `WorldCarId`, `OurCharacter`: a copy; `WorldSends`, `world_reg.Find`: its own), not about the game. In area mode
+  the four reduce to 2.4's tests.
+- *Owner side.* `WorldGameTick` runs `WorldOwnerTick` and `WorldMemberTick` on every game. A viewer is every game
+  with a pose under 3 s whose pose says it plays shared (`kPoseShared`, pose flags bit 6; a game of the other mode is
+  logged once, review_phase1a L9); no join or leave rule, no epoch, no OwnerMap (WOM1 is not sent and is ignored in
+  shared mode). What a viewer gets is decided per object in `world.h`'s scheduler (`InInterest`): people within
+  100 m and cars within 150 m of its camera eye, removed there (`WWR1` reason 1, out of interest, faded) past that
+  plus 20 m; a crew goes by its car, so they come and go together. The chunk-mask filter stays as it was (entries
+  carry no chunk yet, review A3-17). While this game is inactive (its player dead, a cutscene: `WorldSelfActive`, pose
+  bit 7 `kPoseActive`) it has no viewers: its copies elsewhere get reason 3 removes and it offers everything afresh
+  when it is back. Package B (spawning for members' viewpoints, `BoostWanted`, the keep-alive) is off in shared mode;
+  each game's own spawners stay on, so two players together see about two games' density (2b). New trains stay off
+  while a viewer is within 300 m. `QueuePersonEvent` sends a person's events only to the viewers it was created on.
+- *Viewer side.* Every other game's stream at once in the one copy table (keyed by owner). Each owner gets its own
+  WWA1 (to every owner with copies here, declines to report, or a world message in the last 3 s), with what this
+  game holds of that owner's, its own declined ids, its own near counts, and an even share of the caps among the
+  owners with copies here (at least 4 cars / 8 people; 2c sizes the shares). An owner whose pose is 2 s old has its
+  copies faded and told to it as gone; one whose pose says inactive has them faded (it sends their removes itself);
+  either way its creates are declined until it is back, and a game that leaves has its copies faded. The sync checker
+  keeps a sample and a sequence per owner, and judges an owner's samples from 10 s after its first copy here.
+- *Per object, any owner (design 7, review blocker 7).* Hits on a copy go to its owner (`kEventPedDamage`,
+  `kEventCarDamage`, as in 1a); a person's hit on another player's character is sent to that player
+  (`kEventPlayerHitByPed`) by the game that owns the person, never for a copy; copies don't hurt this player, take
+  no damage, take no own actions, calls, reactions, equips, prop drops, shots or launches (`EquipHook`,
+  `PlayActionHook`, `SharedPersonCall`, `AttackHook`, `FireHook`, `ProjectileCreateHook`, `DropGateHook`, the stance
+  and crouch hooks, `CorpseCleanHook`, `IgniteHook`) on whichever game shows them; every owner sends its people's
+  actions, calls, reactions, styles, effects (the attack arrows, now once a second from every owner), rounds
+  (`WorldFireCapture`), projectiles, explosions and blood, and plays the other owners' on their copies (the blood
+  from this game's own people's shots only: `BloodSprayHook`). Explosions: a game holds a copy car's own explosion and
+  a prop a replayed one broke, and sends its own (a prop two games break both send it; the first played wins
+  everywhere, `world_prop_boom`). Bullets on a car copy go to its owner (`WorldCarHit`), the others' on this game's
+  own cars are applied here. Crimes against copies are dropped (their owner counts them). `TrafficDespawnHook` and
+  `ParkedRemovalsHook` keep a car a player sits in on every owner.
+- *Players.* Another player's character is kept to 170 m (the cars' interest; made within 60 m as before), whatever
+  the areas; the maps' markers cover further.
+- *Not in 2a* (2b / 2c). The spawn veto and density share, parked cars, hood and special spawns on the nearest game,
+  keep-alive and the evacuate, the active bit's other states (paused, loading, interiors); the police (each game's own
+  police and response stay on, `kEventSeen` and arrests by copies as in 2.4), missions and the mission lock, dropped
+  items (no item copies in shared mode: each game keeps its own drops), the owner models and the model budget per
+  viewer (the session host's model events are ignored in shared mode, its budget gets no room reports), viewer budget shares by
+  copies and bytes, the pools; the props (`props = 1` still decides by slot 0).
+- *Log lines (shared mode).* `World (owner, shared): slot S is a viewer now (D m from this player) ...` / `... no
+  longer a viewer (why)`; `World (owner): slot S plays world_mode = M and this game M2 ...`; the owner line `World
+  (owner): shared: N viewers (slots ...; per object, people 100 m / cars 150 m)`; per viewer `World (owner) slot S (a
+  viewer at D m): offered ... ; out of its interest N entry-ticks, removed for interest N (sent N)`; the viewer's
+  `World (viewer, shared): held cars ...` and `World (shared): owners shown here N: slot S: cars / people (queued,
+  fading)[, out]; removes out of interest N; owners gone out N (silent N), their copies faded N, creates declined while
+  out N; WWA1 sent N`; `World (viewer, shared): slot S is out (its pose 2 s old | inactive: dead, arrested, paused,
+  teleported or in a cutscene): its N copies here fading`.
+
+**Phase 2b: one street per spot** (`world_mode = shared` only; `area` plays exactly as before). Design 12 (1), (2),
+(3), (4), (10), (14), (21); research: notes/coop-3/phase2b_notes.md. Every game's own spawners run; what changes is
+which spots each one fills and what it keeps.
+- *Spawn veto.* A spawn spot goes to one game: the nearest player by position (2D), every player within 10 m of the
+  nearest one tying with it and the lowest slot of those spawning (`world.h` `SpawnWinner`, unit-tested: exactly one
+  game fills each spot). Only another player whose pose is under 500 ms and says active counts, and only within its
+  own spawners' reach of the spot (people 100 m, traffic 150 m). People: the ambient spawn at a point `8240DD40`
+  (`PeopleSpawnHook`; its callers are the ahead, side and group pickers and the area fill) returns 0 for a point
+  another game fills, so the picker tries its next one. Traffic: the spot query `82412298`'s list loses those spots
+  (`TrafficSpotsVeto`). The chunk mask is not part of the test: the spots carry no chunk and the mask's index isn't
+  known to match across games yet (review A3-17); the reach stands in for "it has the spot loaded".
+- *Density share.* The wanted counts (`824194A8` traffic, `82419208` people) are lowered by the copies of other
+  games' traffic and ambient people that are in this game's own veto region and its rings (people 90 m 2D, traffic
+  140 m), never below 1 (response, mission, crew, hood, special, parked and players' copies don't count).
+  `BoostWanted` is not used. On a meet-up (copies in the region), while this game's ambient count is over its
+  lowered wanted, one of its own people goes every 500 ms through the game's make-room path `8240E448`; its test
+  `8240E338` (not protected, beyond 10 m, not visible here) also refuses, in shared mode, a person another active
+  player's camera may see (within 30 m of its eye, or within 120 m and 60 degrees of its forward row), for the
+  game's own make room too.
+- *Keep-alive.* Package B's hooks hold this game's objects for the viewers instead of the members' viewpoints: a
+  person (`8240FA90`), a traffic car (`82412878`), a disturbed parked car (`8241D6B0`) or an allocator victim
+  (`823FFA48` / `823FFC48`) that streams and that an active viewer has (its copy there, or within its interest: a
+  candidate, design 12/(10)) is held from this game's own despawn for 20 s at most, or until its chunk unloads
+  here (a car's entry inactive; people go with the chunk clear). The 20 s start again once the game kept it itself.
+- *Parked cars.* An undisturbed parked car is each game's own and never streams (`kWhyParked`). Once someone is in
+  it (or a player gets in), its hit points drop or it burns, or it has moved over 1 m, it streams as this game's
+  for good. A game that shows another's disturbed parked car within 2.5 m of its own undisturbed one removes its own
+  through the record (`8241D210(rec, 4)`, the game's "creation refused" state: it isn't made again until this
+  player is past 80 m). By position, because the record ids aren't known to match across games.
+- *Active owner and the evacuate.* The pose's active bit (`kPoseActive`) is also off while the pause menu has been
+  open 1 s, while arrested and for 2 s after a teleport (the player's position jumping over 60 m between two owner
+  ticks); a loading screen stops the game, so its pose goes stale. Interiors aren't told apart yet. On a death, an
+  arrest, a teleport or a cutscene's start the game evacuates (`EvacuateNow`, pose bit 23 `kPoseEvacuate`, area
+  mode's `kPoseWorldStream` never set in shared mode): for 3 s its viewers stay in (what still lives goes on
+  streaming), the viewers don't fade its copies for being inactive, and the copies of what it removes meanwhile stay
+  where they are until the 3 s are over, then fade. Phase 3 hands the objects over at that point instead.
+- *Other spawners.* The hood and special spawns (`824290D0`) are skipped while another active player within 150 m
+  has the lower slot (by the players: the manager's regions aren't read). New trains stay off while another active
+  player is within 300 m. Ambient boats: if they come through the traffic spot query they are vetoed with it
+  (not checked); helicopters are the police's (2c) or the special spawns' (the hood rule above).
+- *Not in 2b.* The hand-over (phase 3: a split still fades the leaving player's share near the others, held up to
+  20 s by the keep-alive), the police response owner, missions, items, owner models and budgets, pools (2c).
+- *Log lines (shared mode, every 10 s).* `World (shared) 2b: spawn veto: people points N (left to others N), traffic
+  spots N (left N; slot S xN ...); this game's region: its own people / traffic, copies of the others' there (the
+  share's), wanted people N (the game's N) / cars ...; culled N (tries N); make room refused ...; kept for viewers:
+  people, cars, parked (their 20 s over N, chunk unloaded N); evictions ...` and `World (shared) 2b: parked: own
+  undisturbed N, disturbed and streaming N (newly N), own hidden under another's disturbed car N; hood / special
+  spawn passes skipped N; new trains ...; this game inactive: dead / arrested / a cutscene / paused / teleported /
+  no player (seconds), position jumps N; evacuations N (...), evacuating N s; copies held for an evacuating owner N
+  (faded after N)`; with `diagnostics = 1` one line per other player's region. One-shots: `World (shared): the first
+  people | traffic spawn spot left to slot S ...`, `World (owner, shared): parked car H disturbed (entered | damaged |
+  moved) ...`, `World (shared): this game's parked car H (record R) removed: slot S's disturbed car ...`, `World
+  (owner, shared): evacuating (why): N objects of this game's are shown elsewhere ...`.
+
+**Phase 2c: police, missions, items, models, budgets** (`world_mode = shared` only; `area` plays exactly as before).
+Design 8 and 12 (5), (6), (11), (12), (13), (16), (20); research: notes/coop-3/phase2c_notes.md. Also the phase 2a
+review's fixes (review_phase2a.md: H1, H2, M1-M6 and some lows).
+- *Police (the response owner).* Wanted players within 150 m of each other (chained) share one response owner: the
+  highest police level, then the lower slot (`world.h` `ResponseGroup`, unit-tested: every game of a group computes
+  the same owner). Its game's response chases the most wanted of the group (`UpdateResponseTarget`, now on every
+  game that owns its group's response, with the group as the candidates instead of `kPoseHostWorld`); the other
+  games of the group start no response of their own meanwhile (`8242ABA0` and the roadblocks skipped; units already
+  out go on, streamed as any person and car). A player alone runs its own. Every game's cops tell a culprit's game
+  whether they see its character (`kEventSeen` from any game, kept per game there). An arrest by any game's cop goes
+  to the culprit's game; one by a copy of another game's cop is refused (the arrester is `r31` at `82483440`: its
+  only caller is the cop's update `820B1A28`). Response copies don't count in the density share (2b) and fade when
+  their owner leaves, as every copy does.
+- *Missions (the mission host and the lock).* Any player may start a mission; one runs at a time. The session host
+  keeps the lock (`kEventMissionLock`: request, grant or deny with the mission's hash, release, and its state to
+  everyone each second). The holder is the mission host (`MissionHost()`; area mode: the session host): every
+  `missions = host` path keys on it instead of slot 0 (its HUD, cutscenes, map icons, mission cars, the follow and
+  the mission state packets; the clock and the pause stay the session host's). A start without the lock is held
+  back, asked for, and started again once granted; a start while another holds it is refused with a notice. A
+  mission or activity that runs without a start co-op saw (an activity's own launcher) asks for the lock once it
+  runs; denied, it runs on its own, its objects local. The holder lets go 3 s after its mission is over. When the
+  mission host leaves, every other game ends the mission it plays for it, with a notice. Only the mission host's
+  mission characters stream: a game running another's mission (the mirror) keeps its own mission characters out of
+  its registry, and its script cars are never streamed, even after the mission.
+- *Items.* An item belongs to the game whose person (or player) dropped it: every game owns its own loose items,
+  tells them to the others and takes the take requests for them; copies of another game's people drop nothing (the
+  cash through `8245A630`, `CashDropHook`). A copy of another game's item is made within 80 m of this player and goes
+  past 120 m or when its owner leaves; copies are keyed by (owner, handle).
+- *Owner models.* Every game sends its loaded people models (`kEventHostModels`) to its viewers each second; a viewer
+  keeps one set per owner and uses their union where 2.4 used the host's. The people-model quota balancer (option
+  c) runs on every game while it shows people copies, the session host too: a level that its own people ask at
+  keeps its slots, the idle levels' slots go to level 0 for the copies. The host's park (`ModelBudgetTick`) is off in
+  shared mode (each game's own people need its own slots). The copies' model pins are given back as in area mode
+  (`SharedModelUpkeep`); the eviction of models outside the owners' sets is not run (it removes this game's own people).
+- *Budgets per viewer.* WWA1 now carries (35 bytes) the viewer's share for that owner of what it takes in (36 KB/s
+  shared out by the copies it holds of each owner, at least 6 KB/s each), its pool caps shared the same way (at
+  least 4 cars / 8 people), the bytes of that owner's world messages it received, and the interest it has room for.
+  An owner's upload is shared only by its busy viewers (something created there, or within its interest); a
+  client's stream to another client also gets the relay's share (the session host's upload over every relayed
+  stream, estimated); the viewer's share caps it, 6-24 KB/s (`world.h` `SharedTickBudget`, `ShareOut`, unit-tested).
+  A viewer whose WWA1 says it received under three quarters of what was queued for it gets half the budget for 2 s.
+- *Pools.* World copies leave room for the other players' characters and cars not made here yet (a reserved floor);
+  when the live pools drop below a margin of 6 people / 3 cars, the interest radii this game asks of every owner
+  shrink by 10 % a second (to half at most), and grow back by 5 % a second once there is room.
+- *Props.* A prop no player decided (an NPC's car, a stray round) is decided by the nearest active player's game (the
+  spawn veto's rule), not by slot 0.
+- *The phase 2a review's fixes.* H1: the cutscene end removes the copies on every game that shows them (the session
+  host too). H2: a mirror's own mission characters stay out of its registry. M1: a hit by this game's own people on
+  another owner's copy (a person or a car) goes to that owner with the attacker's NetId (`kEventHitBy` before the
+  damage event), applied there with its copy of the attacker. M2: a create of an owner still marked out is taken
+  when its pose already says it is back. M3: interest is tested first, so a copy whose chunk the viewer no longer has
+  is removed for interest. M4: let-go crews and copies in the graveyard are left out of the registry. M5 / M6: the
+  budgets above. Lows: L1 (a future timestamp), L2 (an owner's leftovers forgotten when it leaves), L3 (no truth
+  judged for an owner that is out), L4 (owner models), L6 (NPC projectiles within 200 m only), L10 (the mirror's
+  cars); style S1-S3, S5, S6.
+- *Not in 2c.* The hand-over (phase 3), host migration (phase 4), mission objects that aren't people (mission cars
+  stream only with `mission_cars = 1`, as in 2.4), the relay's own per-destination backlog, biasing the model pick.
+- *Log lines (shared mode, every 10 s).* `World (shared) 2c: budgets: busy viewers N of N a tick (relayed N), held to
+  a viewer's share N, a viewer behind N (sent N KB, received there N KB); pools here: reserved ..., room for copies
+  ..., interest asked people N% / cars N% ...; own people's hits on others' copies sent N (cars N), others' people's
+  hits applied here N (attacker not here N); creates of an owner back ... N` and `World (shared) 2c: police: this
+  player's group ... (owner slot S, slots M), in a group N s, its owner N s, own response held for another's N, owner
+  changes N, arrests by copies refused N, seen told N / taken N; missions: lock free | slot S (mission H), asked N,
+  requests N (granted N, denied N), starts refused here N, released N, started N, unseen starts N, run alone N, ended
+  for a host that left N; items: copies gone far N, owner left N; owner models sent N, taken N (their union N);
+  copies' pins given back N passes; props decided here N, by another N`. One-shots: `Police (shared): ...`, `Mission
+  lock (session host): ...`, `Mission lock: granted | denied | let go ...`, `Mission start H refused | held back ...`.
+
+**Phase 3: the hand-over in place** (`world_mode = shared` with `handover = 1`; `area` plays exactly as before).
+Design 6 and 12 (9), (10), (15); research: notes/coop-3/handover_research.md and phase3_notes.md. Also the phase 2b
+review's fixes (review_phase2b.md: H1, M1-M6 and the cheap lows).
+- *What changes hands.* Ambient people on foot and traffic cars with their crews, between the games whose players
+  are near them, without a fade: the old owner's object becomes its copy of the new owner's, the new owner's copy
+  becomes its own (its AI back on, on the ambient or traffic list). Never mission objects, response units, hood or
+  special spawns, parked cars (each game's own until driven: then traffic), followers or the party (a script record:
+  `8244BC40` says no), the dead, a person lying, knocked out, getting in or out, in an action, hidden or fading, a
+  fighter unless its target is the new owner's player, a car a player sits in (the authority path; it goes to the
+  driver's game after 10 s of driving or when that player gets out), a wreck. A car moves with its whole crew.
+- *Who and when.* Only the owner starts one. The candidate is the active viewer whose camera is nearest, holding a
+  made copy, within its keep radius (people 75 m 2D, cars 120 m): another game must be nearer than the owner's camera
+  by 25 m (people) / 40 m (cars) for 2 s, and an object moves at most every 5 s. Urgent (at once): the object past
+  80 % of the owner's despawn ring (people 90 m, cars 130 m). Evacuating (death, arrest, teleport, a cutscene's
+  start: 2b's `EvacuateNow`): every object an active viewer holds within its interest, at once, to the nearest. At
+  most 12 under way at a time (24 while evacuating). `world.h` `HandPick`, unit-tested.
+- *Messages (WWH1, `kMsgWorldHand` = 42, reliable; protocol 10 stays: an older build ignores the type).* Offer
+  (owner -> candidate: the NetId, its epoch e, its record id, the state: position, velocity, hit points, damage, team,
+  combat bits, AI mode, a fighter's target, the crew), Accept (its copies' handles: the ids once adopted) or Decline
+  (no copy, no room, no traffic node, not loaded, too far, busy, inactive, handover off, stale), Release (e + 1, the
+  final state, the slots that hold a copy), Return (e + 2: the candidate can't adopt at the Release),
+  OwnerChanged (the new epoch, the new id, the old key: to everyone). Nobody simulates the object for the trip
+  (two hops through the relay). `world.h` `HandRec`, `HandOut`, `HandIn`, unit-tested with lost and late messages.
+- *Release (the old owner, one update).* A person off the ambient list (`0x8309ABB4`: the reverse of `82479FD8`),
+  category 0 (`82400F10`), `+4244` 0, its order cancelled (`82441308`) and its AI mode 0 (`820D5DA8`), passive, co-op's
+  model reference taken (`8250C750` kind 5, as for a made copy); a car off the traffic list (`824105B8(node)`),
+  category 3, its vehicle AI idle (`825905D0`). Out of the registry with no remove (`Registry::Detach`: the holders
+  keep their copies) and indexed as the new owner's copy where it stands (its follower seeded). With `puppets = 1`
+  its brain goes off as any copy's.
+- *Adopt (the new owner).* Out of co-op's copy tables first, so no copy hook matches it again (`skipped: adopted`
+  counts any that still does: it must stay 0); a person on the ambient list (`82479FD8`, category 1), its nav node
+  (`824A3FB0`, as the ambient spawn asks it), its combat bits as the old owner had them (`MakePassive` undone), its hit
+  points and team, a fresh default behaviour (`820DFF00`; a fighter keeps its own); a car on the traffic list
+  (`82413688`: no free node is a Return), its lane (`82514AF0`'s road segments within 25 m, the nearest heading its
+  way: `825B1AC8` + `825B1BF0`, as the traffic creator does) or else its AI idle, its hit points; its crew category 2.
+  Into the registry with its NetId, the new epoch and the holders' offers already created (`Registry::Adopt`: no
+  creates for them); OwnerChanged to everyone.
+- *Everyone else.* A copy's key moves to the new owner on OwnerChanged, or on that owner's create when it comes
+  first (a create of a NetId held here is never a second copy); records that came early are taken; for 5 s the old
+  key still finds the car (a pose that names it so; the new owner's own pose names it by the old key for 1.5 s).
+  The old owner forwards hits it gets for 2 s (`kEventHitFrom` names the attacker). The digest leaves a copy that
+  just changed hands alone for 3 s, and waits a digest before it calls one with records under 2 s old extra.
+- *Failures.* No Accept within 1 s: the owner keeps it (three silent offers in a row: that game is left alone 60 s,
+  an older build). No OwnerChanged or record within 2 s of the Release: the old owner takes it back at e + 2 and says
+  so. A game that owns an object and hears of a newer epoch (or the same from a lower slot) yields it into a copy; a
+  create from another game of an object owned here is the same test (`two owners seen`). An owner gone (left the
+  session, or removed the object while evacuating): each holder that could own it claims it after 2 s + 250 ms x
+  its slot unless a claim came first (equal epochs: the lower slot). A copy car this player sits in that its owner
+  removes is this game's own at once (`WorldLetGoCar`, owner-aware: no taken car named as the owner's).
+- *The phase 2b review's fixes.* H1: the veto, the share, the cull guard and the keep-alive use every present shared
+  player with a fresh pose (not the viewers: an inactive game has none), and an inactive game leaves the spots near
+  an active player to it. M1: the traffic fill (`82411CC8` -> `82411310`, after a reset) is vetoed too, and surplus
+  traffic is culled (`82410F38`, the car furthest behind this camera that nobody may see). M2: a game counts in the
+  veto only within its reach too, the reaches are 120 m / 160 m, measured from the cameras' eyes (unit-tested past
+  reach). M3: this game's eye as its last sent pose has it, and a player stays in the veto list 1.5 s after its last
+  fresh pose. M4: a parked copy hides this game's parked car once, when it is made, the nearest within 2.5 m still on
+  its spot and heading its way. M5: the evacuation's start is taken on every pass; held copies are out of the digest's
+  check. M6: the hood rule is greedy by slot (unit-tested). Lows: L2 (make room spares a held person; no cull for a
+  mission's empty street), L4 (the shared state reset at the session's end), L5 (an inactive game skips the hood rule
+  near an active one), L9 (the veto hooks' perf part), L10 (style; the 2b line split in two).
+- *Log lines (shared mode, every 10 s).* `World (shared) 3: hand-over: offered N (urgent N, evacuating N, player cars
+  N), under way N, accepted here N, declined to this game N (reasons), no answer N, late accepts N; released N people,
+  N cars (crew N); adopted here N people, N cars (crew N); returned by this game N (declined here N: reasons), returns
+  here N, taken back N (no word N)` and `World (shared) 3: claims: owner left N, removed while evacuating N, a car this
+  player drives N (waiting N); yields N, two owners seen N (kept against N); copies moved to a new owner N, creates of a
+  copy held under another key N (kept N, older N); hits forwarded N, taken from a forward N; not offered: (bars);
+  adopted cars 5 s on: driving N, standing N (lane found N, none N, no traffic node N); skipped (adopted): copy lookups
+  N, copy updates N, in both tables N (all must be 0)`. The 2b lines: `traffic fill spots N (left N)`, `culled people N
+  (tries N), cars N (tries N)` and a second `World (shared) 2b: keep-alive: ...` line. One-shots: `Hand-over: ... is
+  this game's now`, `... released to slot S`, `... yields to slot S`, `Hand-over: adopted car H 5 s on: driving |
+  standing`.
+
+**Phase 4: session host migration** (`world_mode = shared` with `host_migration = 1`; `area` plays exactly as before:
+the session ends when the host leaves). Design 9 and 12 (17); research: notes/coop-3/phase4_notes.md. Also the phase
+2c review's fixes (review_phase2c.md: H1, M1-M9 and the cheap lows).
+- *The rule.* The session host is a role, not slot 0. When it leaves (its `kLeave`, now sent by a host too, five
+  packets: at once) or goes silent (6 s), every game picks the same successor: the lowest slot still present. Slots
+  and names stay; nothing is renumbered. The successor becomes the session host and the relay; every other client
+  links to it again (`kRejoin`: its version, its slot, its name) at the address the session host gave every client
+  in advance (`kPeerAddr`, reliable, at each join, leave and re-link: every client's address as the host sees it;
+  online, the product user ID, which each game maps to its own stand-in address). The new host holds a pending link
+  per client for 20 s (reliable messages for it wait, snapshots are dropped); a client tries for 15 s. What a client
+  had queued for the old host and never saw acked goes to the new one (relayed as before), the successor's own to
+  each pending link. Clients send each other a bare packet once a second (warm links: Epic opens its P2P connection,
+  a NAT its port; every receiver drops them), so a re-link is quick. `net.h` `Session`: `EnableMigration`,
+  `AddressCodec`, `HostSlot`, `Relinking`, `HostHeardAt`, `HostAddress`; inbox-only `kHostMoved` (origin = the new
+  host, then the old one's `kPeerLeft`) and `kRejoined`. net_test case 10 (a host vanishes with 4 clients, its
+  successor leaves cleanly, a new player joins the moved session, two one-way link failures).
+- *When it fails.* A client whose re-link isn't answered in 15 s joins the old host's address again (2.x's "trying to
+  get back in"); a successor nobody links to in 20 s does too (most likely only its own link to the host failed, and
+  the host is still there). A client that doesn't know the successor's address does so at once. A re-link the new
+  host doesn't wait for (it gave up on it, or another name) is a new join (a new slot: the client starts over).
+- *Online (Epic).* The lobby is made with `bDisableHostMigration = EOS_FALSE` in shared mode only (area keeps
+  `EOS_TRUE` and the host destroying the lobby at the end). Decision: the session's own rule decides, and the lobby
+  follows it (not the other way round, which would wait for Epic's notice on every game and could disagree with the
+  net layer's timeouts): EOS picks a new lobby owner when the owner leaves (`EOS_Lobby_AddNotifyLobbyMemberStatusReceived`,
+  `EOS_LMS_PROMOTED`, tells every member), and an owner that isn't the session host gives the lobby to it
+  (`EOS_Lobby_PromoteMember`, every 10 s until it is), so new players, who connect to the lobby's owner, reach the
+  session host. In shared mode every game leaves the lobby at the end (the last one out closes it).
+- *What the new host takes over.* `hosting` and `session_host` follow the role (the network thread sets both at
+  `kHostMoved`), so the clock, the weather and the pause broadcast, the OwnerMap's writer test and every other
+  session-host path move with it. The mission lock: rebuilt on the new host from its copy of the last `kLockState`
+  (every game keeps one), with the generation going on from the newest seen; an ask the old host never answered goes
+  to the new one. If the old host held the lock, its mission ends for everyone as for any mission host that leaves
+  (2c, with the M4 fix below). Its objects follow phase 3's claims (an owner gone). The relay's lost queues: what a
+  client never saw acked is carried over (above); after each re-link the broken cars this game decides are sent
+  again and every viewer's digest comes 2 s later instead of up to 10 s (what the old relay dropped shows as missing
+  or extra there and is asked for again or removed: the existing catch-up).
+- *Copies hold through the gap.* Every other game's stream and pose comes through the relay. While a client's link
+  to the session host is quiet (1 s) or a migration links the session again, an owner's silent pose isn't taken as
+  the owner gone: its copies hold (and an owner keeps a silent viewer as a viewer) until 3 s after the relay is back,
+  at most 25 s (`WorldRelayHold`, WorldHostHold's 3 s per owner).
+- *Also.* A session host in shared mode places the mission host's markers (`IconPosHook`: not the mission host,
+  instead of not the session host) and releases its let-go crews (it never ran `UpdateSharedTraffic`); direct IP with
+  migration turns off Windows' `SIO_UDP_CONNRESET` (a warm packet to a closed port must not break the next read).
+- *The phase 2c review's fixes.* H1: the cutscene end gives back the quota and the people pins on the session host
+  too in shared mode (`!hosting || world_mode_shared`). M1: a mission this game runs on its own (the lock denied)
+  takes none of the mission host's objectives, help, groups or end, and isn't ended when that host leaves
+  (`MissionHereIsHosts`: mirroring, or a mission of its hash). M2: the lock has a generation (`a[3]` of the grant,
+  deny, state and release); the session host frees it only on a release of the generation it holds, and a game that
+  let go ignores a state still naming it and lets go of that one again; `MissionLockRelease` resets `lock_active_at`.
+  M3: a grant after the 5 s timeout (or one no longer asked for) is let go at once; the pending hash is kept, marked
+  late. M4: "the mission host left" ends the mission step by step: a cutscene first (at most 5 s), then `82215360(0, 0)`
+  once a second until no mission runs (at most 10 tries). M5: a game leaves its police response to the group's owner
+  only while the owner's own report (the group mask, now in `kMsgNotoriety`) names it within 2.5 s. M6: the budget's
+  caps (the relay's share, the viewer's share) apply after the 6 KB/s floor, down to 1.5 KB/s (unit-tested). M7: WWA1's
+  `received` is a running total, compared with what the owner had queued a round trip (+ 150 ms) before; a viewer is
+  behind only after two windows in a row over a quarter short (a lost WWA1 costs nothing). M8: the pool reserve counts
+  only the players within 150 m. M9: in shared mode cash drops from a prop's death or a car's destroy only on the game
+  that decides it (its own prop, its own car), never inside another game's explosion or round played here. Lows: L1
+  (the lock's per-session state at file scope, reset at the end), L2 (a granted start isn't made twice), L3 (a new
+  mission host's mission id starts as the lock's hash), L4 (no notice for a mirror's chained start), L5 (an NPC
+  attacker by its game's epoch), L7 (64 of this game's own items, copies not counted), L9, L13; `kEventHitBy` taken in
+  shared mode only.
+- *Wire.* Protocol 10 stayed here (co-op 3 is one unreleased build); the phase 4 review's fixes (below) make it 11.
+  `NotorietyPacket` is 4 bytes longer (M5), so every game needs this build.
+- *Log lines.* One-shots: `Session: host left (slot S), successor slot N (...), N players; the others link to it
+  again`, `Session: NAME (slot S) linked again to this game, the new session host` / `Session: linked again to the new
+  session host (slot S)`, the net layer's `Session: host (slot S) timed out | left: slot N is the session host now`,
+  `Session: session lost: ...`, `Mission lock: this game is the new session host: the lock rebuilt (...)`, `EOS: the
+  lobby's owner changed: ...`, `EOS: the lobby given to the session host: ...`. Every 10 s when anything happened:
+  `Session (10 s): the session host is slot S; host moves N, links made again N (given up N), reliable messages carried
+  to the new host N, warm packets N; relay gaps here N (copies held N owner passes); lobby given to the session host N
+  (session: moves N, links again N)`. The 2c lines gain `stale states N, late grants N, rebuilt by a new session host
+  N` and `(an owner that hasn't named this player yet N refreshes)`.
+- *Not in 4.* Direct links between clients for the world stream (phase 5: the warm links are half of it); a joiner
+  who connects during a migration's few seconds to a lobby owner that isn't the session host yet gets no answer and
+  keeps asking there (it joins once it tries again later); with direct IP over the internet the successor must be
+  reachable at the address the host saw (a LAN, or ports the warm packets opened).
+
+**The phase 3 review's fixes** (review_phase3.md: M1-M6 and the cheap lows; shared with `handover = 1` only).
+- M1: a copy car this player got into while it faded and is then destroyed (`WorldDestroy`) becomes a taken car as in
+  2c; only a copy that stays in the table (`WorldFade`'s path) is claimed in place (`WorldLetGoCar(..., may_claim)`).
+- M2: an offer that came to nothing (declined, no answer, barred at the Accept) isn't made again for that object for
+  1 s (urgent, a player's car), 2 s (evacuating) or 5 s (`WorldObj::offer_retry_at`): no more 250 ms repeats.
+- M3: any Accept or Decline from a slot ends its silence count (only offers that got nothing back count towards the
+  60 s rest). An Accept that brings no Release (the object changed since the offer, or the Accept was late) is
+  answered with a Cancel (WWH1 type 7, `kHandCancel`, unit-tested): the candidate drops its accepted offer at once,
+  and the owner's offer is over.
+- M4: the people the spawn-region manager makes (`824290D0`: its cops are category 1, as the street's) go as hood
+  people (`WorldPersonKind`: kind hood, marked by `HumanCreateHook` inside `HoodSpawnsHook`'s call), so they are never
+  handed over or claimed and don't count in the density share.
+- M5: a take-back after the object moved on (its copy here follows another owner or a newer epoch) doesn't happen;
+  an OwnerChanged from any game at e + 1 or later ends a release (`HandOut::OnOwner`, unit-tested).
+- M6: a parked copy is matched with this game's own parked car on its spot every 250 ms for its first 60 s, and marked
+  matched only on a real match (this game's car may spawn there later, when this player comes nearer).
+- Lows: L1 (a person that sat down since the offer is barred at the Accept; a seated person still on the ambient list
+  is taken off it at the release), L3 (an adopted object's position at once), L4 (`HandOnCreate` only with
+  `handover = 1`), L5 (a forwarded hit's attacker is taken whether the hit applies here or not; a forwarded hit isn't
+  forwarded again), L7 (`kEventHitFrom` names a person only within 1 s, as the damage path), L11 (an adopted traffic
+  car's engine bit, `+53976` 0x08000000), L12 (a damaged ambient list is left alone), L13 (`handover`'s default is 1,
+  as mod.ini ships it; style). Left: L2 (crew epochs), L6 (a hit by the new owner's own player in the release window),
+  L8 (fades instead of a claim's wait), L9 / L10 (cars with no traffic node).
+- Log: the first hand-over line gains `(... not taken back, moved on since N)`, the second `accepts cancelled by this
+  game N, here N`.
+
+**The phase 4 review's fixes** (review_phase4.md: M1-M8, the cheap lows and the style points; host migration is
+`world_mode = shared` with `host_migration = 1` only, apart from the wire changes). Protocol 11.
+- *At most once, in order (M1).* Every reliable game message carries its origin's own count (`MessageHeader.oseq`,
+  u16, kept through relays; the header is 10 bytes, so a message holds 1,144 bytes). Each game delivers from each
+  origin only what is newer than the last it delivered (cleared when a slot is a new player). What a client carries
+  to the new host that the old one had relayed already is dropped where it arrived before (counted), and a carried
+  older message can't land after a newer one. Losses stay losses.
+- *The succession order (M3).* The session host writes each client's seniority into `kPeerAddr` (u32: 1 is the
+  session's first host, the clients count on in the order they joined; a new player is listed once its address has
+  been shared for 3 s, `kListMs`). A new player never inherits a slot's seniority (a slot left and taken again starts
+  at "not listed"), and a new join gets the slot freed longest ago, never-used slots first (L3: no stranger in the
+  old host's slot while its objects are claimed). Every game picks the most senior player still present that it can
+  reach (nobody listed: the lowest slot). `kPeerAddr` also lists the clients still linking again after a migration
+  (their old address, seniority and token hash), so a second migration right after the first can pick them.
+- *Passing over a successor (M2).* A client tries a successor for 7 s (`kRejoinMs`, was 15 s), then the next one in
+  the order; a successor that left (its `kLeave`) is passed over at once. Only when nobody is left does it join the
+  old host's address again, as 2.x. A session host that stops while clients are still linking to it sends each a
+  `kLeave` of its own (five packets, at the address the list gave). So the host and slot 1 dropping together end with
+  slot 2 as the session host (net_test 12), and a successor that leaves 3 s after taking over hands on to the next one
+  (net_test 13).
+- *A split heals (M3).* A session host that took over sends the warm packet too (flagged as a host, with its
+  seniority) to the players not linked to it. A session host that hears a more senior one yields: its clients get a
+  `kLeave` naming that host and link to it, and it links to it as a client, with what it sent that no client acked
+  yet. A false successor (only its own link to the host failed: L5) yields when the old host warms it, or joins the
+  old host again once the clients it waits for still warm it as clients 8 s after it took over (was 20 s).
+- *Re-links are authenticated (M4).* A client makes a random 64-bit token and sends it in `kJoin`; the session host
+  shares only its hash (SHA-256's first 8 bytes, `TokenHash`) in `kPeerAddr`; `kRejoin` carries the token. The new
+  host adopts a re-link only from the address the list gave (online: the same product user ID, which Epic
+  authenticates; direct IP: the same IP, any port) and, over direct IP, with the token whose hash it has. Anything
+  else is ignored (counted), and a `kRejoin` for a slot whose player is linked is ignored too. net_test 15.
+- *Direct IP after a migration (M5).* With `host_migration = 1` a client binds the session port (27015) too when it is
+  free (two games on one PC: another port), so a successor is joined at its IP as before. `join_ip.txt` takes
+  `IP:port` (the session host's port when it isn't 27015). At `kHostMoved` the overlay and the pause menu's line show
+  where the session host is now, and the new host's notice says "Friends join at IP[:port]".
+- *A new session host that was paused for the old one (M6)* lets go of it: its world runs again (`ReleaseRemotePause`,
+  the controls once its own menu is closed); `kHostMoved` clears the old host's pause state.
+- *Joining online during or after a migration (M7).* Of the review's two options, the joiner follows the lobby: a game
+  that isn't in the session reads the lobby's owner again every 4 s (its own copy of the lobby, no Epic round trip)
+  and, when it changed, joins that one (a new join attempt). That covers the joiner that reached the old host, a
+  crashed host Epic noticed late, and a player stranded by a failed re-link. The other option (a client answering a
+  stranger's `kJoin` with the session host's ID) was not done: it needs the joiner to reach a live member, which the
+  first case doesn't. Still open: a lobby owner that isn't in the session itself (it can't hand the lobby on).
+- *Cash (M8).* A person of this game's own that another game's replayed explosion kills here drops its cash here
+  (`CashDropHook` counts it as this game's, as the prop and car paths do).
+- *Lows.* L1: `kRejoin` is ignored with migration off (area mode: no protocol change). L2: the new host's first packet
+  on the client's epoch is the adoption; the client's queue flows from then on, the `kJoinOk` follows in it; a second
+  `kJoinOk` to a joined client is ignored. L4: a client takes the host's `kLeave` only from a packet that acks one it
+  sent in the last 5 s (a blind spoofer can't). L6: `response_group_out` is stored once per refresh (the network
+  thread never reads a passing 0). L7: "the mission host left" never ends the mission during a cutscene: the host's
+  cutscene is ended first, any other is waited for (within the 20 s). L8: a slot's WWA1 baseline and send history start
+  over with a new player in it. L9: a client turns migration on for the session when its host's first `kPeerAddr`
+  comes (the session host's setting counts). L10: over direct IP `kPeerAddr` gives every client every other client's
+  public IP and port (before, only the host saw them); online it gives product user IDs only. L11: a mission host
+  that isn't the new session host asks it for the lock it holds (a rebuilt lock from an older state would read
+  "free"). L12: the lobby's owner is read again every 4 s (`eos::RefreshOwner`); the promotion's result is logged 5
+  times at most, the ask 3 times then once a minute; the counter is "lobby promotions asked"; its timer is reset with
+  the session. L13: `AddressOf` compares handles by their text only for an ID read from the address list (once: Epic's
+  handle replaces it), not on every packet. The player overlay names the session host, not slot 0.
+- *Style.* Protocol 11 (S1); the slot-0 comments and `kJoinDeny`'s inbox origin (S2); `IsJoin` (S3); `SameUser` for the
+  lobby owner (S4); `eos::host_id` is `eos::owner_id` (the lobby's owner) and the promotion timer is at file scope (S5).
+- *Wire (protocol 11).* `MessageHeader` + `oseq`; `kJoin` = version, token, name; `kRejoin` = version, slot, token,
+  name; `kPeerAddr` entries + seniority + token hash; the host's `kLeave` may name a host to link to; warm packets
+  flag a session host (`flags` bit 1, seniority in `ack_bits`). A 10 build is refused at the join with the reason.
+- *Log lines.* New: `Session: host (slot S) didn't answer | left: slot N is the session host now`, `Session: successor
+  (slot S) ...`, `Session: slot N is a more senior session host: this game links to it` and the game's `Session: slot N
+  (NAME) is a more senior session host (the session had split): ...`, `Session: a re-link as NAME (slot S) from another
+  address or with the wrong token: ignored` (5 at most), `Session: session lost: the others are still with the old
+  session host`, `Session: not in the session yet, and the Epic lobby has another owner: joining that one`, `EOS: the
+  lobby's owner is ... (read again)`, `Mission lock: this game holds it: asked the new session host to confirm`, `This
+  game is the session host now: this game unpaused`, `Socket ready (port N)`. The `Session (10 s)` line: `host moves
+  N, links made again N (successors given up N), reliable messages carried to the new host N (delivered already,
+  dropped N), re-links refused N, gave way to a more senior host N, warm packets N; relay gaps ...; lobby promotions
+  asked N, joins started again at the lobby's owner N (session: ...)`.
+- *Tests.* net_test 10 updated (successor by seniority; the new player gets slot 5, one nobody had; the one-way
+  failures pass over successors), new 11 (carry-over duplicates: at most once, in order), 12 (two drops at once,
+  with an address codec as online), 13 (the successor leaves while a client is still linking to it), 14 (a join
+  while a client still links again), 15 (a stranger's `kRejoin` with the wrong token; `TokenHash` against SHA-256).
+
+**The player list** (any mode; mod.ini `player_list`). Research: notes/coop-3/player_list.md.
+- *Hold Back (Select; Tab on the keyboard, the loader's mapping) to see everyone in the session; let go and it is
+  gone.* No gameplay action of any control scheme uses Back (the action tables `0x8203A998` / `0x8203A448`: only
+  `abort` (56) in menus and `mp score` (79), the MP scoreboard `823D4A70`, which also shows only while held), so there
+  is no hold delay.
+- *Input* (`InputHook`, the XInput wrapper `827166D0`, buttons at state + 4, Back `0x0020`, per controller). A press
+  counts only in the world: connected, the MP byte `0x8370E9F6` clear, no pause menu (the state stack) and no pause
+  screen (`0x839E0DF8` != `0x82FFB84C`), and the world HUD drawn with a fade over 0 in the last 250 ms. That press is
+  taken out of the game's pad state until the release, so a menu opened meanwhile (Start with Back still down) gets
+  no `abort`. Pressed in a menu (pause, shops, the phone's screens) Back passes as before and the list doesn't show;
+  held in from a menu that then closes, it doesn't show either (only a press made in the world counts).
+- *Drawing* (`HudHook`, after the story HUD `822E1508`, so it sits over the minimap; the HUD fade `822E3C10` is now
+  read whenever co-op draws anything there, not only with name tags). A centred panel, 22 % down the screen, 740 px
+  wide x the HUD scale (`8263F4D0`, filled, black at 170 / 255 x the fade, params `0x82839AA0`; the screen size from
+  the render state `8263D818()` + 0 / + 4). A 30 px title: `Free Roam  CO-OP n/12`, or `NAME's mission  CO-OP n/12`
+  while everyone plays NAME's mission. A 20 px row of column names in grey: `PLAYER`, `ROLE`, `STATUS`, `DISTANCE`,
+  `PING` (a thin line under the title and under the names). Then a 24 px row per player in slot order (this
+  player's row lit): under PLAYER the slot's colour square (12 px, the map arrow's and the name tag's colour) and the
+  name in that colour (`(you)` on this player's own: its name as it sends it); under ROLE `HOST` (the session host:
+  the role, not slot 0), `MISSION` (the mission host) or `HOST, MISSION`; under STATUS `IN CAR` or `ON FOOT`;
+  under DISTANCE the distance from this player (from the map marker: their character here or their last pose; m,
+  then km); under PING the round trip to the session host. Text as the name tags (`8264E988` twice, px_thinoutline
+  then px_thin, HUD scale x 0.87; the column names x 0.75), the distance and the ping right-aligned by `8264EF48`'s
+  width; the colour white again at the end.
+- *Ping.* Each row's player's round trip to the session host: on the session host its own links (`LinkStats`); a
+  client knows its own link and gets the others' from the session host's roster (`kEventRoster` = 49, once a second
+  with 3 players or more: 12 x u16 in `a[0..5]`, 0xFFFF none). `-` for the session host's own row and for anything not
+  known (no roster for 3 s).
+- *Not checked yet: the phone.* If the phone is a HUD overlay while the world HUD stays on (`0x827AEDF2` set), Back
+  pressed with the phone open would show the list instead of closing the phone (B still closes it). The test says;
+  the fix would be a phone-open test in the press's conditions.
+- *Log lines.* One-shot `Player list: shown (Back held), screen W x H, HUD scale S, panel X, Y, W x H, N players`; with
+  `diagnostics = 1` every 10 s `Player list: shown N frames, Back held in the world N times, passed to a menu N times;
+  draw calls failed N since the start`; failures (`Player list: the rectangle 8263F4D0 failed here`, ...) at most 3.
+
+**The final pre-test reviews' fixes** (review_final_area.md, review_final_shared.md; notes/coop-3/final_fixes_notes.md).
+- *Area mode keeps 2.4's hooks* (area M1). The hooks only shared mode uses go in only with `world_mode = shared`: the
+  cash drop `8245A630` and the spawn veto's `8240DD40` / `82411310`; the puppet brain `820D5B48` only with
+  `puppets = 1`. The copy despawn hook `8244BC40` stays on in every mode. Area also drops the per-origin duplicate
+  filter without migration (L1), and takes `kEventHitFrom` in shared mode only (L6).
+- *A player that left, claimed at the right time* (shared H1). `kPeerLeft` says why (u8 slot, u8 why: `kLeftLeave`
+  for a `kLeave`, `kLeftTimedOut` for a time-out, a fall behind, a new join from the same address, a missed re-link,
+  a lost session). `net.h` `ClaimGate`, fed every session message: the old host a `kHostMoved` names is claimed only
+  once this game is linked again (`kRejoined`), so a game whose own link failed never claims the world the host still
+  owns; a player that timed out is claimed 8 s later than one that left, and not at all if a player with the same
+  name joins in that time (its copies fade, and it brings its world back as new objects). A client that still hears
+  its session host and gets a `kRejoin` (a game whose link alone failed takes it for a successor) answers with a
+  `kLeave` on epoch 0 (u8 its host, u8 1); a game whose move began with the host's silence then joins the host again
+  at once instead of trying every successor 7 s each, and the host sees the same name join again before its own
+  time-out. net_test cases 16 and 17.
+- *The relay gap* (shared M1, M2). While `WorldRelayHold` is on, the views keep the last poses (fresh for the veto,
+  the hood rule, the density share and the keep-alive) and the police group stays as it was; the hand-over timers
+  stand still, no offers start, and every claim is due 2 s + 250 ms x the slot after the gap at the earliest. An
+  Accept or Decline also ends a slot's 60 s rest.
+- *Hand-over.* A re-keyed copy drops its evacuation deadline (M3) and takes the new owner's kind (L3); an adoption
+  sends the kind it has now. A car goes with its crew only when every seated person is crew or ambient and the game
+  would remove it (`8244BC40`, M4). Special spawns and a mission's cars never move, also when a player drives them
+  (M5). With `puppets = 1` an adopted fighter that was a puppet gets a fresh default behaviour too (its own brain
+  never ran here; M7: chosen over declining the offer, so fights still change hands). A replaced copy always goes to
+  the graveyard (L4).
+- *Also.* The mission host's markers on a person or car follow that host's copy, not the session host's (M6). The
+  rebuilt lock's generation steps 0x100 past the newest seen (L2). An inactive game whose evacuation is over keeps
+  nothing alive for viewers (L1). The session host's relay passes every 6th pose (5 a second) to a player over 300 m
+  from the pose's sender (shared only, M8). The player's own name is read once per session, not every 10 s (area L5);
+  the registry never throws (area L7); the old-build notices say co-op 3.0 (protocol 11).
+- *Log lines.* `Session (10 s):` gains `relayed here N messages, N KB/s (far players' poses held back N)` (printed
+  whenever the relay passed anything on: 3 players or more) and `a link alone failed (a successor still hears the
+  host) N`. `World (shared) 3: claims:` gains `owners held for this game's re-link N, timed out and held 8 s N, called
+  off: the player came back N, copies faded for it N; claims pushed past a relay gap N; slots left out of offers 60 s
+  (no answers) N`. `World (shared) 2b: spawn veto` gains `views gone stale N`. `Puppets (member)` shows with
+  `puppets = 1` without `diagnostics`. `World models` counts people taken over with the copies.
+
+**The clothing pool** (any mode; mod.ini `clothing_pool`). Research: notes/coop-3/clothing_memory.md,
+clothing_impl_notes.md.
+- *Why.* Each other player's character took a full set of clothing components, one per category (54, table
+  `0x8310CF78`), in one 5.9 MB physical block per player-pool slot (`EnsureComponents`), on top of 16 MB for the 11
+  body stream slots. On the PC the 4th other player's block failed (`Clothing memory: 5.9 MB block not available`),
+  and a player in a 29-33-item outfit still came up short in a few categories: its pieces were "unloaded" and dressed
+  again every 3 s. In single player any free component of a category goes to whoever asks (`8248D5F0` looks at the
+  owner only with the MP byte set), so the sets were one shared pool per category anyway.
+- *Demand-sized.* Right before an outfit goes on (the first dressing and every dressing again, `ClothingPlan`) each
+  worn item's category is read the way the game wears it (`WornItemCategory`: `8248DE28`'s unpacking, `82318788` /
+  `82312B10`'s item, substitution and piece lookup; the piece's category at +32) and the rings are grown in stages
+  (`clothing.h` `GrowRings`; `82488A30`, linked in at the ring's tail as `8248DAA0` does, flag 0x20): this outfit's
+  base layer, then the base-layer items of the other players here that hold no component, then the rest of the
+  outfit, then a spare in each base-layer category; the last two only with room left after them for one more base
+  layer. A stage waits until the ones before it are grown, so nobody's hat comes before someone else's pants. Every
+  free component goes on (none is kept back). A category whose ring can't grow (`Max_equipped` 0) is planned like an unknown one:
+  its item goes on as in 2.4. A character taken off (or removed past 130 m) frees its pieces in their rings for
+  anyone. The base-layer items of every player in the session count, also one without a character here yet (its
+  last outfit received); a hat never takes the component another player's base-layer hat needs; the rest leaves room
+  for one more base layer per player whose outfit hasn't come yet, plus one. A buffer free again is used for any
+  category it is big enough for. After the items went on and before the game's queue loads them, the record's nodes
+  say where each item went (`ClothingAfterWear`): a category the plan didn't see coming gets its component then (outside
+  the base layer only when the plan grew the rest too); a planned item without a node was dropped by the game.
+- *After a session.* The game's cleanup (`8248DBB8`, at a mission start outside a session) takes every 0x20 piece
+  away without looking whether it is worn. Co-op's pieces still in use (+132 0x10 / 0x40) or referenced (+20) lose
+  0x20 first and stay (`KeepWornPieces`; with 2.4's sets too): the local player or the player copy can be wearing
+  one. The buffers of the pieces the game took are used again by the next components (`ClothingReclaim`); the
+  arenas, the components left in the rings and the body block are used again by the next session (an online session
+  stopped, then a direct-IP one: `Co-op memory kept from earlier sessions: ...`). For 30 s after the last other
+  character is gone, co-op's components that nothing uses go back the way the cleanup does it, and an arena none of
+  whose buffers a component holds goes back to the game (`827166B0`, the game's XPhysicalFree): `Clothing pool after
+  the session: N components and N arenas given back ...; kept for the next session: ...`. The 30 s open once per
+  session (armed at the session start) and are never extended, also with a piece still worn; UpdateBody runs them
+  once a second before its idle return, so they don't make the session-over block run every frame in single player.
+  The game's own cleanup outside a session (each mission start) gets 7 s of the same (`Clothing pool after the
+  game's cleanup: ...`, 10 lines). Only a component in its ring, free (+132 without 0x08 / 0x10 / 0x40 / 0x80: the
+  game's release clears 0x08 and 0x80 with 0x10), with no wearer (+20 0), that no node of the 12 customization
+  records points at, found so for 5 s, with the game's clothing queue idle; a piece still worn keeps its arena. The
+  body block is kept (group 3's slots point at it). mod.ini `clothing_release = 0` turns all of this and the memory-low
+  state below off: the pool keeps its memory until the game exits.
+- *Memory.* The buffers (the category's `Slot_size`, 4 KB-aligned) are cut from 1 MB physical arenas (`82716618`,
+  64 KB pages, first fit), not one block per player. No arena is made that leaves less than 12 MB physical memory
+  free, nor one that would take the lowest reading of the last 5 min (read every 2 s; each reading counts the arenas
+  as free, so arenas made since count against it) below 11 MB; the first 5 min, and a minute after a gap of more than
+  10 s in the readings, 16 MB (`MmQueryStatistics`, thunk `0x82789394`; if it refuses, 24 MB of arenas at most).
+  Below 8 MB free (or that lowest less the arenas now below 9 MB) memory is low until growth would be allowed again
+  (12 MB free and that lowest less the arenas 11 MB; reset at a session start): no component is added, the farthest
+  players lose what they wear outside the base layer (then, still below 8 MB, all their items if beyond 60 m, back
+  once memory is), and the components nothing uses and empty arenas go back to the game. Nobody is shed while co-op
+  holds no arena (the low is the game's own), nor after 30 s of shedding in which no arena went back (an arena freed
+  starts the 30 s again; `clothing.h` `MayShed`). (The
+  game itself swings 5-6 MB below the level the arenas were made at, and was seen running at 11 MB:
+  TEST-3.0-bots12-findings.md.) On the PC that leaves about 6-10 MB of arenas: about 4 basic outfits, or 5 base
+  layers (the second 12-bot test: about 6 dressed characters, host included). Dressing 11 others needs the body block
+  (below) or the runtime's chunk2. A buffer given back merges with the free buffers right before and after it in the
+  same arena (never across two: they go back to the game one by one), one at an arena's end goes back to its free
+  tail, and a component takes only the bytes it needs from a bigger free buffer (`clothing.h` `SpareAdd` /
+  `SpareTake`): a player's hat, glasses and gloves were cut one after another, so together they can hold a pair of
+  pants.
+- *The body block* (mod.ini `own_body`, `own_body_max`). Other players' own body models take 11 stream slots of
+  ~1.46 MB in one 16 MB block (group 3, made at the first character with its own body), the biggest co-op allocation.
+  With more than `own_body_max` players (6) in the session when the first character asks for its body (on the host
+  of a session over half that size 5 s after, so the players joining together count: `BodySettles`), it isn't made: `Own body: off past N players (N in the session; ...),
+  16.0 MB left for clothing: everyone here shows this game's body shape for this session`; the characters get the
+  shared body at once, and the clothing pool sees the 16 MB as free memory. Held for the session; the next one decides
+  again. Once made it stays, also when the session grows past `own_body_max` (`Own body: N players, past
+  own_body_max N, but the 16.0 MB body block was made with N players in the session and stays`): group 3 loads each
+  body model at base + slot x size (`8250D3E0`) and the characters here are drawn from it, co-op's references on
+  them (`8250C750`, kind 5) are never released, and nothing in the game frees group 3's memory (its only writers are
+  the static initialiser `8277A9E8` and multiplayer's `8247E0E0`), so freeing it would need every such character
+  made again with the shared body and every slot unloaded first (not done: memory_fair_notes.md 2). So the first join
+  decides: a host whose players come one by one makes it; a game that joins a session of 7 or more doesn't. A failed
+  block no longer goes on to a group 3 load (its slots would have been cut from address 0).
+- *Nearest first.* An item whose category has no free component is left off, never put on (no "No place to put
+  streaming component model", nothing to dress again). While memory is short (a player was left without something
+  in the last minute), players within 60 m (kept to 80 m) get their full outfit and farther ones the base layer: hair,
+  undershirt, overshirt, underwear, pants, shoes and skin (an item the game drops because something was left off, the
+  hair in its hat wear without the hat, makes the hat part of that outfit's base layer). Once a second
+  `ClothingPoolTick` picks at most one outfit change (`clothing.h` `PickChange`): a player beyond 80 m wearing
+  something outside its base layer that a nearer one (20 m nearer or more) lacks into the base layer (nobody nearer
+  loses what it wears for someone else); then, nearest first, a player back into its full outfit or into what it
+  lacked once a component is free or an arena may be made (a near one in the base layer at once). A far player goes back into its full outfit only when all it left off has a free
+  component (or memory isn't short and an arena may be made); one that came up short then waits 1 min for the next
+  try, doubled each time up to 8 min (no base / full flip-flop).
+- *Fair sharing* (memory_fair_notes.md 1; the second 12-bot test: 6 players in full, hats and all, the 6 who came later
+  bare). While a player here lacks part of its base layer and no new arena may be made: the co-op components nobody
+  uses outside those categories go back (their buffers become free buffers any category can take), nobody gets
+  anything outside the base layer (no way back into a full outfit, no retry for a hat, a first dressing puts on only
+  the base layer), and only the players lacking base-layer items are dressed again, once one of them has a free
+  component or a free buffer that holds it. When nothing is free, nothing fits and nothing given back is still on its
+  way (5 s), one player's extras (hats, glasses ...) on co-op's components are taken off (into its base layer, never
+  less: `clothing.h` `PickTake`): one off this screen before one on it, then the farthest, the nearest last; one
+  every 5 s, one per player per 10 s; their memory then goes to the base layer. A component belongs to one category,
+  so a hat taken off gives nobody pants: its buffer does. With room for an arena every plan grows the others' missing
+  base layers first anyway (stage 2), so a base item missing for another reason never holds everyone's extras back.
+  Once every base layer is on, the extras come back as before, the nearest first (also into a free buffer that holds
+  them).
+- *No dressing loop* (the 12-bot test: 11 players dressed again once a second, 50-90 ms each). The clothes check
+  compares with what the slot listed right after the dressing (the game drops some items, and the slot's worn list
+  never shrinks: `8248D198` leaves its entry), not the plan's count. With the pool only a new record is dressed again
+  at once; a count change or unloaded pieces wait for 2.4's back-off, the player's 10 s, the session's 1 s gap and no
+  other dressing under way (`clothing.h` `MayRedress`). A player its last dressing left short is dressed again
+  (by the clothes check or the tick) only after memory changed: the memory epoch moves on when an arena is made,
+  buffers come back, a character is removed, a dressing puts on less, a category someone lacks has more free
+  components than a second before, or an arena may be made again (room for 2 MB after none; at most every 30 s, a
+  later one waits). Pieces the game unloaded don't wait for the epoch (2.4's back-off). A dressing whose character is
+  gone, or that started more than 20 s ago, holds nobody back. One dressing at a time: none starts while another player is between its take-off and its wear (its pieces
+  are free in their rings for those frames; another plan took them and undressed Bot1).
+- *Diagnostics* (log only). `ComponentPickHook` on `8248D5F0`: a request that found no component, counted per
+  category, the first 30 logged with the model, the player slot, the ring and what the record lists in that category.
+  A record listing two nodes in one category with the queue idle is logged once per record and category (20 lines).
+- *Log lines.* `Clothing pool: started with N components ...`, `Clothing pool: arena N at X (1024 KB), physical free N
+  MB before it`, `Clothing pool: no new arena (N MB physical free, lowest N MB in 5 min; N MB kept free, 11 at the
+  lowest) ...`; per dressing `Player N clothing plan (full | base layer): N items, N go on (N not known here), N left
+  off for the distance, N for memory (categories); grown: (how far: its base layer short of memory ... all of it and
+  a spare) (N base-layer items of the others here held for them); N components added, pool ...`; `... clothing: worn
+  but not planned: ...; planned but not worn: ...`; `... clothing: the game didn't put on ... now go with its base
+  layer`; `... clothing: into the base layer ...` / `back into the full outfit` / `dressed again: free now: ...`;
+  `Co-op memory kept from earlier sessions: body block N MB at X; N clothing arenas (...), N components free in their
+  rings` at a session start; every 10 s `Clothing: N players fully dressed, N in the base layer, N short of memory, N
+  undressed; pool N components added (MB in use in N arenas, N buffers spare), physical free N MB (lowest N in 5 min,
+  room for N MB more); N arena refusals (N this window), N component objects refused; dressings N this window,
+  dressing again held back N times (memory epoch N); no place N (categories); in use / in the ring: per category
+  grown` (with `N with all items off for memory`, `N components and N arenas given back` and `MEMORY LOW, giving back`);
+  `Clothing pool: memory low (...), giving memory back` / `memory back (...)`, `... clothing: into the base layer for
+  memory` / `all items off for memory`, `Clothing pool: memory low, but co-op holds no arenas: nobody shed ...` /
+  `... but 30 s of shedding gave no arena back ...`, `Clothing pool: arena at X (1024 KB) given back to the game`;
+  fair sharing: `... clothing: extras off for the others' base layer (categories; N m, off screen; memory N MB physical
+  free; lacking: ...)`, `dressed again: room (a spare, an arena's tail or a new arena) for ...`, `Clothing pool: base
+  layer short (...), and nobody left wearing extras on co-op's memory to take` (once a minute), and in the 10 s line
+  `N lacking part of the base layer, extras taken off N times for it (N this window)`; the body block: `Own body on up
+  to N players ...` at start-up, `Own body: off past N players ...`, `Own body: N players, past own_body_max ...`.
+- *Tests.* `tests/clothing_test.cpp` (`clothing.h`): arenas (first fit, alignment, give-back, the 16 MB floor of the
+  first 5 min, 12 MB / 11 MB at the lowest after it, the low water and its gaps, arenas made since the low, the 24 MB
+  cap when free memory isn't known, memory low and when it clears, an arena given back only when unused, spares across
+  categories, the headroom, a reserved base-layer hat), the shed (nobody within 60 m stripped, `MayShed`), tiers and
+  hysteresis, what an outfit wants, every free component usable, the base layer (no eyes), which items fit (the base
+  layer first, never one without a component, a ring that can't grow), the worn-list filter, `PickChange` (nobody
+  within 80 m undressed for another, a far one only for what a nearer one lacks, one per player per 10 s, no change
+  when nothing is free, a far player's upgrade only when all of it fits, the upgrade hold, no retry before memory
+  changed), the stages (base layers for everyone before a hat, the rest only with room for one more base layer, a
+  spare only for the base layer), `Promote` (the hat-wear hair; re-planned at once), the retry with room and no
+  free component, and `MayRedress`; free buffers split and merged (`SpareTake` / `SpareAdd`, never across two
+  arenas, the tail back to its arena, `BufferRoom`), fair sharing (`MayTakeExtras`, `PickTake`: off the screen first,
+  the nearest last, only co-op's components, the 10 s; `PickChange` with a base layer short: only its retry, no hat
+  back, no rule 1, a shed player back into its base layer; one take, its memory back, the pants on, nothing more
+  taken), and `DecideBodyBlock` (the 5 s, off past `own_body_max` for the session, kept once made, 0 = no limit).
+
+**The fades fix** (any mode; `view_holds = 1`, below). The 3.0 test f77fa75c (area, `puppets = 1`): people and cars faded out on
+the member's screen right in front of it. Every one was the owner's own game removing its object for the owner's
+camera (each removal a WWR1 the member faded over 1 s wherever it looked), and with puppets the fading people froze
+mid-stride. Research: TEST-3.0-f77fa75c-findings.md; notes/coop-3/fades_fix_notes.md.
+- *A fading puppet stands.* `WorldFade` turns the puppet off (its brain runs again: `PuppetBrainHook` leaves a fading
+  copy alone) and stops it where it stands whether or not `moving` is set (`Place` clears it every update, so the
+  stop never came: "fading people stopped" went from 433 to 2).
+- *The owner holds what a member sees.* A removal the owner's game asks for again and again is refused while a member
+  (shared: an active viewer) shows the object (its offer created) and may see it (`cw::SeenFrom`: within 30 m of its
+  eye, or in front of it within 60 degrees and the interest + 20 m), for 20 s at most (`cw::HoldAsk`; a path that
+  leaves it alone 2 s starts a new hold, but not within 30 s of the last one's end, `cw::kHoldCoolMs`, so the
+  housekeeping can't hold one car in 20 s slices for ever). While the object is being handed over to a member
+  (`HandBusy`) it is held and its 20 s stand still, until the hand-over's answer or its own time-out:
+  - the off-screen cull `8241C498` (off the owner's screen, past 20 m, its model slot doomed): its destroy from LR
+    `8241C680` is refused in `HumanDestroyHook` (people) and `VehicleRemoveHook` (the car of any occupant); so is its
+    car pass `8241C7F8` (the same loop over the car lists: an empty, parked or swapped-model car; LR `8241C90C`,
+    "off-screen car cull"); the doomed slot is freed once the hold is over. The game's own (priority < 5) model swaps
+    wait up to 20 s per held object's doomed slot meanwhile; the mod's own requests (priority 5) never do;
+  - the traffic housekeeping `82410B80` (its oldest cars deleted off its screen, else faded): its pick `824108D0` (new
+    hook, `TrafficOldPickHook`; its only caller). In its at-once call (off the owner's screen) the pick is asked again
+    with a held pick moved behind the count, so the game takes another car; none left: -1, as when it finds none. In
+    its fade call (every other candidate is on the owner's screen) a held pick gives -1: no car this pass (traffic
+    one over until the next pass, 0.4-0.6 s on), never a fade the owner would watch instead.
+  - The game's limits stay first (`WorldHoldRoom`, at a hold's start): at most 8 people and 4 cars held, none for a
+    person whose category is at its limit (ambient 26, traffic crews 20) or with the people pool 2 from full, none for
+    a car while the traffic list has 12; in shared mode none within 2 of the other games' copies' room either
+    (`WorldCopyRoom(false)` for people, `WorldCarRoom` for cars). The make-room path and the allocator's evictions are
+    unchanged, so the owner's own spawning still finds room. The distance despawns keep 2.4's rings (area) or
+    `WorldKeepShared` (shared): a separate keep on separate paths, so in shared mode one object can be kept 20 s by
+    each.
+- *The member fades only what it sees.* `WorldFade`: a copy off this screen (the game's own frustum test `823FE380`,
+  as its traffic removal uses) or past the copies' interest + 20 m (people 120 m, cars 170 m) goes at once with no
+  fade, as the game removes its own traffic out of view; one on the screen fades as before at any distance it can
+  have a copy (a 60 m cut-off popped people 60-120 m ahead). This applies in area mode with `puppets = 0` too: it is
+  a change on every member, not only with puppets (by design: the owner's removals faded wherever the member looked).
+- *Standing copies off their spot.* A puppet whose state isn't in its anim set (2.4's move orders, its brain off) is
+  stopped where it stands up to 25 m off its path (it was ordered to walk to the path point, which nothing carried
+  out: copies stood 3-10 m off for 30-60 s), its running order cancelled (`82441308(h, 0, 0)`; no new order to
+  where it stands, which would never run either), held standing from up to 6 m, and `SmoothWorldPeople` steps a held
+  puppet back from up to 6 m (2 m before): 0.35 m a frame per 6 m of gap over 1 m (within 1 m in about half a
+  second, not a 2-4 s slide in its idle pose), 5 cm a frame under 1 m. Over 1 m off and off this screen
+  (`823FE380`) it is put on its spot at once. One standing 6-25 m off is left to `Drive`'s placing, counted and
+  logged (`Puppet H standing D m off its path: A m after Drive's placing (state +516 N, +508 N)`, 20 lines) to settle
+  whether `MoveHuman` places a brain-off copy at all.
+- *Log lines.* Owner, with members: `World (owner) removals: people: <path> N (on a member N: in its view N, within 30
+  m N), ...; cars: ...; held for a member's view (...): people now N (begun N, their 20 s over N, not held at the
+  game's limits N, asks held for a hand-over N), cars ... (...; housekeeping passes that removed none N)`, the paths
+  by the destroy's return address or the deciding hook (a hook's hint counts only within 3 s): off-screen cull,
+  off-screen car cull, model unload (`8244BCE8`), make room, distance despawn, traffic housekeeping, region check,
+  corpse clean-up, chunk clear, other. Once per name: `World (owner): story character NAME (person H, kind K) left out of the stream (host-only,
+  2.1's rule), D m from slot S's camera` (log only, to decide which to stream). Member: `World (member) removes by
+  this camera: cars faded in view N, at once behind N / far N; people ...`; `Puppets (member)` gains `stopped 1-25 m
+  off the path N, pulled back standing: put back unseen N; standing 6-25 m off N, still 6 m off after Drive N`.
+- *Area mode with `puppets = 0`* is not 2.4 plus the hold: the member's at-once removal off the screen (above) and the
+  player list layout (`IN CAR` / `ON FOOT`; 2.4's `DOWN` is gone) apply there too. Both are intended. Fixes 1 and 5
+  (the fading puppet, the standing puppets) are puppet-only.
+- *Tests.* world_test: `SeenFrom`, `HoldAsk` (20 s whatever the asks, then none until a 2 s gap and 30 s after its
+  end; the housekeeping's re-arm), `SightOf`.
+
+**The fades fix, round 2** (any mode; `view_holds = 1`, below). The 3.0 test 6d607dde (area, `puppets = 1`, a police level 5
+fight): the member faded 160 people in view in 6.9 min, about half of them living people on foot; the biggest owner
+path was unnamed ("other"), the cull's people holds never began (refused at the ambient category's limit, where the
+cull always runs), and the 2.1 story-character rule left most of the SWAT out of the stream. Research:
+TEST-3.0-6d607dde-findings.md; notes/coop-3/fades_fix2_notes.md.
+- *The removal paths named.* New hooks on the fades themselves, `824517A0` (a person) and `82537D40` (a car): for
+  this game's own objects the caller names the path the owner counts when it sees the fade (`WorldFadePath`): the
+  distance despawns (`8240FBB0`, the traffic update `824129C8`), the housekeeping, "corpse fade" (the corpses' own
+  timer, `82476FA8`), "wreck clean-up" (`8253F9D8`, the 7th wreck's `82568908`), "the car's own update"
+  (`8253E938`) and "script" (`team_despawn` `824DD0B0`, a group's cars `8256B428`, `824C4B58`'s script functions).
+  What no path names is split by the object: a person in a car or taken by its car's removal (`825324D0`'s seat
+  passes) is "a removed car's crew", a dead one "dead (no named path)", a wrecked car's fade "wreck clean-up"; a fade
+  from another caller is "a fade the game began (other caller)". The rest stay "other", and those and the unnamed
+  fades are counted by return address (16 a window, the 8 most in a new line).
+- *Holds at the category's limit.* `WorldHoldRoom`: a person whose spawn category is at its limit is still held, up to
+  `cw::kHoldAtLimit` (4) of that category at once (the cull only runs on a full street: a model swap into it); the
+  pool test (2 from full), the caps (8 people, 4 cars) and the shared mode's margin are unchanged.
+- *The distance despawn in a member's view* (area mode). Past `PeopleDespawnHook`'s 90 m ring, a person a member shows
+  and may see (`cw::SeenFrom`: in front within 120 m, or within 30 m) is held as the cull's are (`WorldHoldSeen`: 20
+  s at most, the same limits and cool-down), at most `cw::kHoldFar` (4) of the 8 at once, so the cull's in-view
+  holds near the members keep the rest. Shared mode keeps `WorldKeepShared`.
+- *Dead bodies linger on the member.* `WorldFade`: a dead copy (not seated) removed while on this screen isn't faded:
+  it lies on (no record moves a fading copy) until it is off this screen, then goes at once, or `cw::kCorpseLingerMs`
+  (30 s) pass, then it fades; `cw::kCorpseLinger` (4: the game's corpse manager keeps 5 bodies) at once at most, the
+  rest fade as before (`WorldLingerOver` each apply pass; a session's end fades one still on the screen). Chosen over
+  holding the owner's corpse clean-up `824793C0`: the owner's game and its pools stay as they are, and a corpse can't
+  desync. On the member, `CorpseCleanHook` keeps a lingering body from that game's own corpse clean-up until its 30 s
+  are over (the corpse manager `82476FA8` sets its fade bits on the body's timer, or past 5 bodies), with the same
+  loop guard as a kept dead copy.
+- *Story characters* (2.1's rule, `kWhyNamed`): the name test ignores case (`lw_w_m_swat01` counted as one), and the
+  rule never takes response units, crews or spawn-region people: SWAT and police stream.
+- *Dead copies' positions.* A corpse lying with its ragdoll slot gone to a newer fall (`+784` -1: the game has 12)
+  is put on the owner's corpse once (the teleport `8243E6F8`), when the owner's lies still, it is over 2 m off and
+  off this screen. The sync checker counts a person dead or in its ragdoll on the owner apart (`position: dead or in
+  its ragdoll`, its line with the copy's `lying` and `slot`).
+- *Log lines.* Owner: `World (owner) removals` gains the new paths and `begun N: at the category's limit N, from the
+  distance despawn N (refused, 4 of them held: N)`, `in a hold's 30 s cool-down N` (people) and `cooling down N` (cars); new `World (owner)
+  removals by return address (other, and fades the game began from an unnamed caller): [fade from ]LR people N (in
+  view N) / cars N (N), ...; more N`. Member: new `World (member) people removed in view: living on foot N, dead N,
+  lying N, seated N; past 60 m N, past 90 m N; dead bodies left lying N (then off the screen, gone at once N; faded
+  after 30 s N; taken by this game first N, its removal let through N; faded at once, 4 already lying: N)`; with
+  diagnostics, `Corpses (member)` counts the clean-up's runs skipped for lingering bodies; `Deaths and wrecks` ends with `corpses with no ragdoll slot put
+  on the owner's unseen N`.
+- *Tests.* world_test: the despawn hold's cone (90-120 m ahead, not behind, not past 120 m) and the new constants.
+
+**The overnight review's fixes** (coop3-17; review_overnight.md, notes/coop-3/overnight_fixes_notes.md).
+- *The session-end clothing release arms again* (M1). A Host / Join press stops the last session first, and that
+  Stop's clean-up ran `ClothingSessionEnd` while nobody was connected yet: the new session's arm was used up before
+  anyone joined, and after the session nothing went back. The clean-up now ends the clothing session only when the
+  session stopped (`!running`), not on a lost link; a host whose clients all left keeps its arm until its own Stop.
+- *`ClothingSessionStart` on the game thread* (L1). It ran on the frame thread inside `StartSession`, where the game's
+  own cleanup (`StripRemotePiecesHook`, the guest thread) could change the same vectors. The press now sets a flag,
+  and the next `UpdateBody` (with `game_mutex`, on the game thread) runs it.
+- *A car back in a member's interest keeps its damage* (M2). The pass-1 fix forgets a car's parts on the member when
+  a create comes with no copy held (a new car in a reused handle), and that also hit the same car made again after
+  leaving the member's interest: its dents, panels, glass and tyres were gone until it was hit again. The owner now
+  sends a broken car's parts in full (`SendCarParts(key, v, true)`, broadcast) 1 s after it queues a create of it for
+  any member (`CarPartsCreated`, `kCarPartsAfterCreateMs`), and a member keeps parts taken in the last 5 s at a create
+  (`kCarPartsFreshMs`: they are that car's, whichever came first). The NetId the review suggested can't tell the two
+  apart: its nonce is the origin's per session, so a reused handle gets the same NetId.
+- *The view holds can be turned off, and pause* (M3). `view_holds = 0` (mod.ini) turns off what the two fades fixes
+  hold or change on purpose: `WorldHoldSeen` (the cull, the car cull, the housekeeping pick, the far despawn hold) holds
+  nothing, and on the member a copy off the screen fades as before and a dead body isn't left lying. The rest of the
+  fades fixes (the paths named, the story-character rule, the corpse put-back, the puppet stop) stay. With holds on,
+  none begins or goes on during a cutscene (here, or `host_cutscene`) or for 10 s after `MissionStartHook`
+  (`cw::HoldsPaused`, `kViewHoldQuietMs`): those loads may wait on a held object's doomed slot. Counted in `World
+  (owner) removals` (`asks not held for a cutscene or a mission start: people N, cars N`).
+- *The pool's own changes every 5 s* (M4). A change `ClothingPoolTick` begins (rule 1 into the base layer, a retry, an
+  upgrade, a shed) waits for `clothing_next_pool` (the last one + `coopclothing::kPoolGapMs`, 5 s) as well as the 1 s
+  gap (`PoolChangeDue`). A new record and a first dressing keep the 1 s gap, so a player who joins is dressed as
+  before. Items are taken from a player off this screen first (`View::on_screen`, the game's frustum test `823FE380`;
+  `TakeFirst` in `PickChange` rule 1 and `PickShed`), then the farthest. Rule 2 (giving items back) stays nearest
+  first.
+- *Lows.* L2: `world_seen_hold` loses a handle in `WorldObjectGone` and is cleared in `WorldRegistryOff`
+  (`WorldSeenHoldForget`). L3: a lingering body counts toward the member's people cap. L4: the dressing lines (`Dress
+  slot`, `clothing: N bytes`, `dressed again`, `clothing lost`) at most 40 a minute (`DressLog`, the rest counted in the
+  next). L6: the `player_list` comment in mod.ini. L7: `clothing_pool = 0` is 2.4's clothing plus the worn-piece guard
+  (`KeepWornPieces` runs after a session that made 2.4 sets too: the game's cleanup outside a session keeps 2.4 pieces
+  still worn or referenced instead of putting them on its free list). L8: `Clothing pool: arena N at ...` and
+  `memory low` / `memory back` at most 50 a process. L5 (the item-category cache kept across sessions) is not done:
+  the cost is one-off, and the session-start clear is the safe side if the item table can change with the same count
+  (not checked).
+- *Tests.* All three run after each change: `tests/net_test.cpp`, `tests/world_test.cpp` and
+  `tests/clothing_test.cpp` (`clang++ -std=c++20 -O1 -I core/WhompaysCoop core/WhompaysCoop/tests/<name>.cpp -lws2_32`;
+  exit code 0 = passed). world_test: `HoldsPaused`. clothing_test: `PoolChangeDue`, and `PickChange` / `PickShed`
+  taking from a player off the screen first.
+
+**Players' vaults and climbs** (any mode; mod.ini `climb_sync`, no protocol change). Research:
+notes/coop-3/vault_climb_research.md; notes/coop-3/vault_audio_impl_notes.md. In the 3.0 f2534683 test another
+player's character slid over a wall in its run pose. Their 5/x climb states were replayed on a character with no climb
+record of its own (its own ClimbStart is blocked), so 824623C8 dropped it to 1/0 on its next update, while the jump's
+3 s hold (`jumping`, ended only by 4/E) kept it placed on their path in steps.
+- *Phase 1, the receiver's holds.* A 5/x on the character is never played (`climb_states_left`). Without a replayed
+  climb it starts the fallback (`climb_anim_only`): their climb's actions (0x218, 0x217, 0x213, 0x219) play while it
+  follows their path, `GameFrame` smoothing it each frame (no longer skipped for this hold), until their 6/E or 0/0
+  (or 1/x after their drop), 2.5 s at most. A jump's hold also ends on 6/E and 0/0 (`jump holds ended`), and Drive's
+  ">2 m/s path cancels a hold" rule leaves climbs alone (a vault is done at a run).
+- *Phase 2, the climb replayed* (`kEventClimb = 50`, kinds up to 49 are taken; an older build ignores the kind:
+  `ApplyEvents` tests kinds one by one). `ClimbStartHook` for our player (`82444270` returning 1): the position just
+  before, the climb point, `PackDir` of the frame's row 2, `coopworld::PackClimbInfo` (flag, state / sub before, the
+  new sub-state, the caller from the return address: `8216AC90` ground, `823F6BB0` jump grab, `824634A4` fall grab)
+  and the yaw. The receiver holds it by the follower's delay like the states (`ReplayClimb`): within 3 m of the start
+  the character is put there (`MoveHuman`, rows from the yaw with its own handedness, `coopworld::ClimbRows`), then
+  under `replicated_depth` the game's own finder `8234A1C8(point, frame, &flag, human)` (as the game's MP apply
+  `823AFA88` calls it) and, when its ledge is theirs (`coopworld::ClimbLedgeMatches`: within 0.5 m, facing within
+  ~37 degrees), `82444270(character, point, frame, flag, this game's ledge)`. On 1: `climb_replayed`. Drive leaves it
+  alone up to 4 m from the path, `GameFrame` skips it, and their 0 / 1 / 5 / 6 states and actions 0x20B-0x219, 0x2A,
+  0x2E are not played (`climb_actions_left`): its own 824623C8 / 82463100 play them. `UpdateClimbHold` hands it back
+  (`coopworld::ClimbHoldStep`) once the character is out of 5 / 6 (past 150 ms; M3 below), 400 ms after their end, or
+  at 2.5 s; placed on the path when more than 1.5 m off (`snapped`). Watchdog: out of state 5 within 150 ms, the
+  fallback. No ledge, another ledge, refused or too far: the fallback too. A second `kEventClimb` within 300 ms is
+  ignored. Lines: `Climb sent: ...`, `Climb on Player N: replayed / no ledge here / another ledge / refused / too far /
+  aborted`, `Climb on Player N ended after N ms: ...` (40 each side), the sender's states and actions for 2.5 s after
+  its climb (`Climb: our player sends ...`), and a `Climbs:` line with the Perf line.
+
+**Sound after cutscenes** (any mode; mod.ini `audio_repair`). Research: notes/coop-3/audio_cutscene_research.md. The
+player report: "audio seems to disappear and randomly come back after cutscenes". A joiner's unlock popup (state
+enter `822A7800`, after a mission end) pauses the world without sound (`8220C778(0)`, from `822A784C`) and then the
+sound on its own (`821007C0(500)`); its exit's unpause (`8220C868`) takes the sound count `0x8370CF84` down only on
+the world counter's 1 -> 0. PauseHook skipped the world pause, so the count stayed at 1 until the next cutscene's end.
+- *The root fix.* A skipped pause from `822A784C` or with r3 = 0 (only `822A7800` passes 0) owes a sound pause
+  (`unlock_sound_owed`). `UnpauseHook` (`8220C868`): an unpause about to do nothing (world counter 0) with one owed
+  pays it back after the original, the game's way: `8220C778(0)` then `8220C868` under `pause_passthrough` (the
+  world counter 0 -> 1 -> 0 in one update; not `821F73A8`, which also takes one off the s16 `0x83710230`).
+  `Unlock screen: its sound pause handed back (sound count N -> N, N owed)`.
+- *The watchdog, on every game (the session host too).* `UpdateSoundWatch` logs each change with the reasons that
+  hold (200 a session): `Sound pause count now N (was N): pause, cutscene D991/D990/D99C step D998, loading, video,
+  death, menu, owed, last skipped pause`. The game's reasons (`SoundReasons`): the world pause counter
+  `0x8370DAE4`, a cutscene (`0x8370D991` / `D990`, `D99C`, a deferred step at `D998`), the loading counter
+  (big-endian at the unaligned `0x8370DB34`), a video (`0x8370D9B2`), the death / busted sequence (`0x840B5E00`), the
+  pause menu or game state 12 on the state stack (its enter has its own sound pause), an owed popup pause (60 s at
+  most). Above 0 with none for 5 s (`coopworld::SoundStuck`): repaired with the same pair, up to 8 times.
+- *Safe points* (the same test without the 5 s): `CutsceneEndHook` after the original, the end of
+  `ReleaseRemotePause`, and the session's end (`SoundSessionOver`, which pays any owed pause first and logs
+  `Session over: sound pause count N -> N. Sound: N changes, max count N, N unlock pauses handed back, N watchdog
+  repairs, N cutscene ends held for their begin`).
+- *Co-op's forced cutscene ends* (`821F9700` in `UpdateSharedCutscene`, the HUD's mission end, the mission host left)
+  wait while the start's deferred begin is pending (`0x8370D998 == 821F7640`, or `0x8370D990` still 0), up to 1 s
+  (`CutsceneEndNow`, `coopworld::CutsceneEndWaits`): an end in that window left the start's sound pause on, and the
+  begin still ran after it. `Cutscene end held: its start's begin is still pending`.
+- *Tests.* world_test: `PackClimbInfo`, `ClimbCallerOf`, `ClimbLedgeMatches`, `ClimbRows`, `ClimbDropsState` /
+  `ClimbDropsAction`, `ClimbOwnerEnds`, `ClimbHoldStep`, `SoundStuck`, `CutsceneEndWaits`.
+
+**The memory-fair / climb / audio review's fixes** (coop3-21; review_memfair_vault_audio.md; the progress logs in
+notes/coop-3/memory_fair_notes.md and vault_audio_impl_notes.md, "Review fixes").
+- *M1.* Fair sharing gives co-op's free components back only with `clothing_release = 1` (with 0 no memory goes back
+  until exit, and so no extras are taken off either: their memory would stay with their components), and never an
+  arena: `ClothingGiveBack(..., free_arenas = false)` turns the buffers into spares and keeps the arenas for them.
+  Arenas go back in memory low and after the session only, as before (no free / re-allocate churn at the floor).
+- *M2.* A component's idle time must be seen at every look (`clothing.h` `IdleWatch`: `IdleSeen`, `IdleBusy`,
+  `IdleLongEnough`): a look missed for over 1.5 s (its category left out of a partial give-back, a busy clothing
+  queue) starts the 5 s again, so a piece worn and taken off meanwhile never goes back on a stale start.
+- *M3.* A replayed climb is handed back once the character's own state is out of 5 and 6 after the first 150 ms,
+  whatever the owner sent (a climb that ends on top sends 5/x -> 1/0 with no drop: it was held 2.5 s). The owner's
+  5/x and drop still to come are the climb's tail (`coopworld::ClimbTailStep`): not played and no fallback started,
+  until the owner's end or the climb's 2.5 s.
+- *M4.* A `kEventClimb` arriving while the character is still in its own state 5 ends the hold and takes the
+  fallback (`still climbing` in the `Climbs:` line): `82444270` is never called on a climbing character (no caller
+  in the game does). State 6 is fine (`82463100` grabs from it).
+- *M5.* The body block's decision waits 5 s only on the session host with 3 or more players and over half of
+  `own_body_max` (`clothing.h` `BodySettles`); a 2-player session and a joiner (it gets the whole player list at
+  once) decide at once. A character's 8 s wait for its body starts only once the block is decided, and a failed block
+  counts as held off (`OwnBodyHeldOff`): the characters after it get the shared body at once.
+- *Lows.* L1: `clothing_base_pressure` cleared in memory low. L2: fair sharing keys on an arena that can really be
+  made (`room` and not refused by `82716618`). L3: a component idle for 15 s or more no longer counts as freeing
+  (`IdleFreeing`: one that can't be unlinked never holds the takes). L5: the path 4 m or more ahead during a replayed
+  climb ends the hold at the next update (placed on the path) instead of the path's moves fighting the climb. L6: an
+  event with bad numbers no longer drops a jump's hold. L9: `CutsceneEndNow` holds nothing with `audio_repair = 0`.
+  L12: the cutscene end's safe point only repairs a count with no reason; the owed popup pauses are left to
+  `UnpauseHook` and the watchdog (not paid inside `821F9700`). L13: the sound watchdog runs 30 s past the session's
+  end (also with co-op stopped), so a count left above 0 by a session that ended during a reason is repaired. L14:
+  mod.ini `climb_sync`. Not changed: L4 (a take may hit a donor wearing the game's own extras; bounded by the donors),
+  L7 (the opening action played by the fallback and again by the replay comes in the same pass: no frame drawn in
+  between), L10 (past 60 s an owed popup pause is no longer a reason: the world keeps running in co-op, so the
+  watchdog unmuting a popup left open that long is wanted), L11 (any no-op unpause while the popup is open repays a
+  little early; the count stays right).
+- *Tests.* clothing_test: `DecideBodyBlock` with the settle flag, `BodySettles`, `IdleWatch` (continuous, a missed or
+  busy look starts again, freeing for under 15 s). world_test: `ClimbHoldStep` (out of 5 / 6 after 150 ms hands
+  back), a climb ending on top (5/5 -> 5/9 -> 1/0, no 6), `ClimbTailStep`.
+
+**Pose bandwidth, protocol 12** (any mode; mod.ini `pose_tiers`, `send_pacing_ms`). Research:
+notes/coop-3/pose_bandwidth_design.md; notes/coop-3/bandwidth_impl_notes.md. The 12-bot test relayed 1.08-1.10 MiB/s:
+the 392 B pose was mostly a model name, a look block and car fields that never change, and worn items, sliders and
+colours went to everyone every second. `net.h` `kVersion` 12: 3.0 builds before this (11) are refused at join.
+- *The compact pose* (`WPP2`, world.h `coopworld::PosePacket`, 48 B; + `PoseCar`, 27 B, in a car): sequence, sender
+  time, the float position at offset 12 (the relay reads it), rows / camera as `QRot` (smallest three), the eye and
+  the car's position as `QPos` 2 cm offsets from the player, car velocity `QVel`, spin `QAng`, flags as before, a form
+  byte and the sender's appearance version. Mirrored rows (the right row negated, the `kPedSign` convention: det < 0)
+  are negated into a rotation and flagged, for the character, the camera and the car. An eye or car over 655 m from
+  the player goes as none / at the player. `EncodePose` / `DecodePose`; the receiver takes exactly 48 B, or 75 with
+  the car flag. The game side keeps `PlayerPose`: only `SendDue` and `OnGameMessage` changed. The pose goes on a 33 ms
+  schedule (at most 30.3 a second; it was `now + 33`).
+- *The appearance* (`WAP1` on the free type 23, `kMsgAppearance`: version, model, look; 21 B for `StyleTest_PC`):
+  reliable to everyone when the model or look changes (its version +1, never 0), reliable to each player who joins
+  (`kPeerJoined`) and to everyone after this game's own join or re-link (`kJoinOk`, `kRejoined`), unreliable every
+  5 s. The receiver keeps it in `remote_in[o].pose.model / look` (where the game side reads it). A character is made
+  only once their WAP1 is here (and is the version their pose names), up to 3 s (`Player N: no appearance ... after
+  3 s`), then from what is here (`kFallbackModel` when nothing is).
+- *Worn items, sliders, colours* the same way (reliable on a change, at most every 250 ms per kind; to joiners; every
+  5 s unreliable; they were every second). Notoriety unchanged. *Car looks* (`WVL1`): reliable when one is new or
+  changed and to a joiner, one a second unreliable, cycling (it was 3 every 100 ms); `PruneCarLooks` drops cars that
+  are gone or no longer this game's (the set never lost one: ~10 KiB/s per player who had driven 3 cars).
+- *The relay's tiers* (`RelayPoseFilter` = `coopworld::RelayTiers`, both world modes, the session host's own pose
+  too: `Session::Send` asks the filter per link for its own unreliable messages, and every client's unreliable
+  message is noted once with target `kEveryone`, so a lone client's position is known). By the 2D distance from the
+  pose to the target's last pose through the relay: every pose within 60 m, 10 a second to 170 m, 5 to 500 m, 3
+  beyond, 10 m hysteresis, by the sender's clock (a pose passes when the tier's interval less 8 ms passed since the
+  last one passed to that target). At once at any tier: a change of the state bits (in the car, shared, active,
+  ragdoll, dead, host world, world stream / evacuate: `kPoseStateBits`, asserted against `kPose*`), a car entered or
+  left, a jump over 40 m; a car faster than 20 m/s goes one tier nearer. A pose older than the last one passed is held
+  (the receiver drops it anyway); over 2 s back the sender restarted. Reset at `kHostMoved` (a new relay passes
+  everything until it knows both positions), a slot forgotten at `kPeerJoined` / `kPeerLeft`.
+- *Receivers.* `Follower::jump_up` (the players' characters and cars): two sender gaps in a row over the delay less
+  20 ms raise the delay at once (gap + half the spread + 20, capped), so a move to a slower tier doesn't run the path
+  past its newest record. `FollowVehicle`: base delay 30, sampled at `max(30, delay - 40)` behind the newest pose (30
+  ms as before at 30 a second; at 10 / 5 a second the fixed 30 ran up to 170 ms past the data and snapped).
+- *Send pacing* (`Session::PaceUnreliable`): a link's packets with only unreliable messages go at most once per
+  `send_pacing_ms` (10); a reliable message due (the oldest's resend, the newest unsent) goes at once.
+- *Lines.* `Bandwidth (10 s): out N KB/s (N packets/s, headers included; pacing N ms), in N KB/s; pose tiers (to 60 /
+  170 / 500 m / past): passed ..., held back ..., at once N; poses refused N, WAP1 refused N, taken N, older ones
+  dropped N; camera not sent N (last det X), with no eye N; own by type: ...; relayed by type: ...` on every connected
+  game (the order since the review's L12) (net.h `Stats::sent_type` / `relayed_type`). The Session line's
+  "far players' poses held back" counts the tiers' holds.
+- *Measured* (coop_bot `--bench`, fake host and bots on 127.0.0.1, 30.3 poses a second each, KiB/s; host out is
+  `bytes_out` with the 16 B packet headers and the fake host's own small world stream):
+
+  | players, case | relayed before | relayed after | host out before | host out after | a bot in before | after |
+  |---|---|---|---|---|---|---|
+  | 4, together | 76.7 | 11.7 | 145 | 47 | 48 | 16 |
+  | 8, together | 537 | 82 | 703 | 164 | 101 | 23 |
+  | 12, together | 1406 | 214 | 1679 | 343 | 153 | 31 |
+  | 12, spread 20 / 100 / 300 / 700 m (area) | 1404 | 67 | 1634 | 140 | 149 | 13 |
+  | 12, together, all in cars (75 B) | | 302 | | 432 | | 39 |
+- *Tests.* world_test: the WPP2 codec (on foot, mirrored rows / camera, no camera / eye, a far eye, a car, a far
+  car, malformed), WAP1, `RelayTiers` (30 / 10 / 5 / 3 Hz at 20 / 100 / 300 / 700 m, flips / car / jump at once, the
+  fast car, hysteresis, unknown target, `Forget`). net_test 18: the tiers through a Session (the host's own pose and
+  relayed ones), a state flip, `PaceUnreliable`. coop_bot `--selftest`: WPP2 / WAP1 both ways, every WAP1 within 1 s
+  of the first pose, the 5 s refreshes, the tiers at 20 / 100 / 300 / 700 m with a car bot.
+
+**The bandwidth review's fixes** (coop3-22; review_bandwidth.md; notes/coop-3/bandwidth_impl_notes.md "Review
+fixes"). No wire change (protocol 12 as above); the sender's rules and the receivers changed.
+- *M1.* A character waits for the WAP1 its pose names up to 9 s (3 s while the pose names version 0, none sent yet),
+  then is made with what is here. One made so (or whose model changed since) is made again as soon as a WAP1 brings
+  another model (`Remote::made_model`, through `force_remake`, at most every 5 s: `Player N: their appearance brings
+  model '...' (the character was made with '...'): made again`).
+- *M2.* The sender orthonormalises the camera (`coopworld::CamUsable`: Gram-Schmidt from the forward row, then up;
+  right = up x forward, negated when mirrored) and refuses only a degenerate one (a row under 0.1 long or |det| under
+  0.1; it was |det| 0.8-1.25 untried against the real block). No camera goes without the eye (an eye over 655 m from
+  the player sent "none", and the receiver wrote eye 0,0,0 into +4112). Counted in the Bandwidth line (`camera not
+  sent N (last det X), with no eye N`); one `Camera sample: det X, rows ... long` per session.
+- *Lows.* L1: a WAP1 1-8 versions older than the one held is dropped (`coopworld::AppearanceStale`; `older ones
+  dropped N`), and a change goes reliably only 30 ms after its kind's last unreliable refresh (the refresh could still
+  sit in the paced queue while the change went first). L2: rows that aren't a rotation (|det| under 0.5: all zero for a
+  matrix not set yet) go as identity, not a 180-degree roll. L3: `UnqRot` renormalises (a malformed packet's three
+  over-long components). L4: a seat of 8 or more, or an owner slot of 12 or more, goes on foot (no car tail), not as
+  the driver of slot 0's car. L5: in a car, another seat, car handle or car type passes the relay at once. L6: the
+  fast-car rule has hysteresis per pair (one tier nearer over 22 m/s, back under 18). L8: the appearance wait starts
+  again when the player leaves the 60 m or their WAP1 version changes. L9: `Follower::jump_up` needs three long gaps
+  in a row once the delay is 90 ms or more (two lost poses one apart at 10 a second raised it to ~240 ms for 1.5 s).
+  L11: the join texts name the release (3.0 of 2026-10-24 or newer; an earlier 3.0 is protocol 11). L12: the
+  Bandwidth line puts the counts before the type lists (2048 B). Not changed: L7 (T3 stale views, noted), L10 (pacing,
+  documented), L13 (perf, microseconds), L14 (coop_bot, test tool).
+- *Tests.* world_test: `AppearanceStale`, a scaled / skewed camera sent orthonormalised, a degenerate one refused, a
+  far eye with no camera, all-zero rows, a malformed rotation, seat 9 / owner 12 on foot, a seat swap / car handle /
+  car type at once at 700 m, the fast-car hysteresis. coop_bot `--selftest` passes (it builds on world.h / net.h).
+
+**Memory step 1: the body block of K slots** (mod.ini `own_body_slots`, default 2; research:
+notes/coop-3/memory_plan_12.md section 2, notes/coop-3/memory_steps_impl_notes.md).
+- *What.* At the first character with its own body, group 3 (the multiplayer player bodies, `kStreamTable + 3 x 204`
+  = `0x83E87914`) gets K load slots, not the 11 it was built with at boot, and a block of K x 1.46 MB (1,528,320 B
+  each), not 16 MB: (11 - K) x 1.46 MB stay free for clothing whatever the join order (K = 2: 13.1 MB). The first K
+  other players' pool indices get their own body shape; the next one gets this game's at once (no 8 s wait:
+  `OwnBodyFull`). A body model no character here is drawn with for 5 s gives back its reference (`8250CA48(group, id,
+  5, 0, 0)`, `OwnBodyRelease`); the model stays as a cache and the pass can load the next player's into its slot.
+- *How (H, the recompiled game).* The pass `8250D3E0` takes free slots from the group's +60 queue and loads into
+  `+36 + index x +32`; the boot reset had queued all 11, so writing +0 alone would have let a load past the block.
+  Co-op writes +0 = K and runs the group's own reset `8250DC00` (the game runs it from `8250F008` on every unlocked
+  group): it clears both queues (`8250BB60`), rebuilds the free-slot queue for +0 slots and sets quota[0] (`*(+196)`) =
+  +0; it leaves +32 / +36 alone. Only while the group is idle (`coopclothing::BodyGroupBusy`: the game's 11 slots, all
+  in state 4 and queued, the slot lists +12 / +16 / +20 / +24 and the active request records +48 empty, nothing
+  queued at +56, not locked): else the block is made with 11 slots as before (logged). The flags' 0x40 is kept.
+- *Lines.* Start-up `Own body: the first K other players get their own body shape ...`; at the block `Own body: group
+  3 cut to K load slots (now K, quota[0] K, K free queued)` and `Own body: player body streaming memory X MB at ...
+  (K of 11 slots ...: Y MB saved ...)`; `Own body: StyleTest_PC_MPn's reference given back ...`.
+- *own_body_max* stays (its count and settle wait as above), default 0 now: the K-slot block is small. `own_body_slots
+  = 0` is `own_body = 0`; 11 is the old block.
+- *Tests.* clothing_test: `BodyGroupBusy` (each condition), `BodySlots`, `BodyRefs` (at most K, a held index keeps its
+  body, given back after 5 s unused, used again starts over).
+
+**Memory step 3: item-sized clothing buffers** (mod.ini `clothing_size_log`, `clothing_item_sized`, both 0;
+research: memory_plan_12.md section 1). The loader stages a piece in a buffer of its category's `Slot_size`
+(`request+80`, `8248A100`) and `8248AD88` copies all of it into the component (`memcpy(component+12, request+92,
+request+80)`), so a buffer smaller than `Slot_size` needs both guards below.
+- *The item's size S* = peg pointer + peg size - staging (`8248D5F0`'s r6 / r7, `request+92`; the peg is the job's
+  last file, 4096-aligned, `825134F8`); not known (full size) for a pointer outside the staging buffer or a morph
+  after the peg (`coopclothing::ItemBytes`).
+- *Phase A* (`clothing_size_log = N`): the first N picks logged, `Clothing size N: <mesh> (<category>): S ..., Slot_size
+  ... (P %); staging ..., mesh +0, peg <name> +X (Y B), morph ...`, and an `item sizes:` part in the Clothing line
+  (picks, not known, the largest S / Slot_size, the average S / Slot_size). Compare with the packfile sizes offline
+  (`<mesh>.cmesh_xbox2` + `.peg_xbox2`, research `tools/vpp.py`).
+- *Phase B* (`clothing_item_sized = 1`, outside multiplayer only): in the pick hook, before the game's pick, the free
+  co-op components smaller than S get +132 0x10 for the call (the picker skips them as busy); the record's nodes on a
+  co-op component smaller than S get node+12 = 0 for the call (the second chance can't swap into it; with nothing
+  else the game fails cleanly, "No place", and the old item stays); with no free component and no node that holds S,
+  one of AlignUp(S, 4 KB) is made at once (`AddClothingComponent(..., bytes)`); the free co-op component the picker
+  takes (idle: no 0xD8, refs 0) is cut to AlignUp(S), the rest going to the spares that any later component takes by
+  size (`ClothingTrim`). `ComponentCopyHook` on `8248AD88`: into a co-op buffer B smaller than `request+80`, B bytes
+  are copied when S fits, else the component is passed as 0 (the game's null path: the item is asked again). An item
+  of unknown size is guarded as full size. `ClothingPlan` still budgets `Slot_size` (an upper bound). Clothing line:
+  `item-sized: N buffers cut (X MB to the spares), N made for one item (N refused), N too small hidden, N swaps
+  refused; copies N shortened, N REFUSED`.
+- *Tests.* clothing_test: `ItemBytes`, `PlanPick` (hide, clear, trim, grow, the record's own holds it, busy not cut,
+  under 4 KB over not cut, S unknown), `CopyGuard`.
+
+**Memory steps 1 and 3: review fixes** (research: notes/coop-3/review_memory_steps.md, memory_steps_impl_notes.md
+"Review fixes").
+- *H1, the key-5 player copy.* `OwnBodyRelease` counts as drawn every pool object not on the pool's free list
+  (`0x8309ABE8`, linked at +4100) whose body definition (+228) is its own `StyleTest_PC_MP<index + 1>`, plus the copy's
+  index itself (`coopclothing::BodiesInUse`); a free list that can't be read counts none free. A reference a drawn
+  character uses is never given back (the next load would overwrite the mesh it is drawn from).
+- *H2, the game's own multiplayer after a co-op session.* `MpBodySetupHook` on `8247E0E0` (from `82370A68`; it gives
+  group 3 a new 11-slot block at +36 / +32 and force-unloads the loaded MP body models, but leaves +0 and the queue):
+  before it runs, with group 3 below 11 slots and not locked, co-op's references go back (`8250CA48`), the loaded
+  `StyleTest_PC_MP` models are unloaded as the original would (`8250CD88` and its byte at `*(0x8370FED0) + (id &
+  0xFFFFFF) x 16 + 12`; the reset runs no unload callback), +0 = 11 and `8250DC00` (queue for 11, quota[0] 11).
+  Line `Own body: the game's multiplayer body setup: group 3 back to the game's 11 load slots from K (...)`. If the
+  hook doesn't install, `own_body_slots` isn't used (11 slots, logged).
+- *H3.* Phase B (`clothing_item_sized`) is turned off (logged) when the copy hook on `8248AD88` doesn't install.
+- *M1.* On a copy refusal the reserved component's 0x10 is cleared when nothing holds it (no +20 reference, no node of
+  the record on it); refusals are counted per item (`coopclothing::CopyRefusals`) and after 2 the item gets no
+  component again (`StopPick`: every free one hidden, the record's nodes cleared: the game's clean "No place"; also
+  in multiplayer). The pick guard covers the whole ring and record (vectors, not 64-bit masks; `kPickWalkMax` 4096
+  is only a broken-link guard).
+- *M2.* `ItemBytes` needs the mesh in [staging, peg) (`8248D5F0`'s r4, `request+164`) and a morph inside it; else 0
+  (full size). Phase B works with S + 4 KB (`ItemNeed`, at most `Slot_size`) for the hide, clear, trim, grow and copy
+  until phase A's S is confirmed against the packfile sizes.
+- *Lows.* L3: a reference isn't counted unused during its 8 s load wait (`BodyRefs::Take(index, now)`); L4: a held
+  index whose request record a world reset freed is taken again while drawn, else forgotten (`BodyRefs::Drop`); L5:
+  `OwnBodyRelease` skips a locked group; L6: `BodyGroupBusy` wants exactly 1 level (only level 0's queues are read);
+  L7: `RelayTiers::Pass` reads the car tail only from a pose of `kPoseInCar` bytes. The Clothing line adds `N
+  components unreserved, N picks of a twice-refused item failed`.
+- *Tests.* clothing_test: `BodiesInUse` (the copy, an active pool object on its own definition, a free one, the free
+  list not read), the copy's reference kept, the 8 s wait, `Drop`, `BodyGroupBusy` with 2 levels, `ItemBytes` with the
+  mesh, `ItemNeed`, a 100-component ring guarded whole, `StopPick`, `CopyRefusals`. world_test: a 48-byte pose with
+  the car form relayed as on foot.
+
+**Player cap and appearance fixes** (research: notes/coop-3/appearance_feedback_research.md, mjq_fixes_a_notes.md).
+- *The player cap* (mod.ini `max_players`, 8). `Session::MaxPlayers`: the session host refuses a join once the
+  players and the slots waiting for a re-link reach it, with the existing `kJoinDeny` ("the session is full (N players,
+  the session host's mod.ini max_players)"; the joiner's notice `Co-op: couldn't join - ...`). `kJoinOk` carries the
+  host's cap after the names (part of protocol 13), so a client's player list shows `CO-OP n/N` (`SessionMax`). The
+  Epic lobby's `MaxLobbyMembers` is `max_players`. The slots stay 12; after a migration the new session host's own
+  setting counts (whoever is in stays; re-links aren't counted against it). Online, the Epic lobby keeps the first
+  host's size after a migration, so the cap is the lower of the two, and a joiner Epic refuses gets Epic's error, not
+  "the session is full".
+- *The look block on any human.* A player whose character is an actor of another definition (the SR Tweak Menu's
+  model swap, a female model) gets their look block (`ApplyLook`, 8238B258: race, head, hair, outfit variants), when
+  the character was made with their model (not `kFallbackModel`, `Remote::their_model`) and no other model waits to be
+  made. Clothing, sliders and colours stay with player objects.
+- *Colours with the shared body.* Skin tone and hair colour changes after the first dressing now go on for players
+  past `own_body_slots` too. Read in the asm: 82322050 -> 82322328 writes only the colour table entry of the record's
+  own slot (`+8`), and the rebuild 8248A900 frees and makes again the render instances of the record's nodes and of
+  `*(record+16)+3732` (82230D78 writes the instance); the body model is only read. The sliders still need their own
+  body (they bake into the shared mesh).
+- *Outfit changes settle, then go by difference* (clothing pool only). The sender sends a new worn list once it held
+  1.5 s (`coopclothing::WornSettle`; the first at once, a joiner gets the settled one): the Tweak Menu's hover
+  try-ons and presets go out once. The receiver plans the new outfit at its take-off as before (`ClothingPlan`: the
+  pool decides what goes on), then takes off only the pieces not in the plan or not on (8248D198 per piece; a piece is
+  `WornItemPiece`: the 68 B entry the record's node +0 holds) and wears only what isn't on (8248DE28), `DressDiff`. The
+  rest stays on: no bare body. By difference there is no 8248D340 step: it isn't a commit but a loop of 8248D198 on
+  the record's first node until none is left (every piece off); the wear waits for the take-off requests
+  (`ClothingQueueIdle`). The plan is made once at the take-off and also used when the dressing goes in full. Everything comes off as before for a first dressing, a new record, the clothes check's
+  re-dress and the colours' (`full_dress`), an item not known here, and once for an outfit whose new items the game
+  didn't take by themselves (`NotWorn`, right after the wear: `diff_failed_for`). Lines `outfit changed: by
+  difference, N pieces off, N items on, N stay`, `dressed again (by difference)`. `clothing_pool = 0` is unchanged.
+- *The look kept through the game's reverts* (mod.ini `look_restore`, 1). In a session the local worn list, sliders
+  and colours are kept once they held 2 s outside missions and cutscenes (`LookKeep`). `SaveLookHook` on `82208640`
+  counts a call from the mission cleanup (returns to 82210D3C, `82210BE0`) as a revert, `RevertLookHook` on `82209190`
+  one from the mission end (82212030) or restart (82212B1C); any other call (the load request `82208C48`, the
+  console's `customization_revert`) is the player's: what was kept is forgotten. 2 s after a revert, outside a
+  cutscene with the clothing queue idle, `LookRestoreTick` puts the look back the game's way (82318B38, the colours,
+  8248DE28, 8248CFC8, the sliders' wanted values, the colours with the look rebuilt). Lines `Look restored after the
+  game's revert to the save (from ADDR, ...)`, `Look: ... it is the one kept, nothing to restore`, `Look: a save was
+  loaded ...`. The look the revert left is read once its clothing requests are done; nothing goes back on while a
+  mission runs (a restart, the next mission: its own end reverts again), nor when the look changed since the revert
+  (a mission's disguise, a script's customization, the player's own change: `Look: ... but it changed since ...: not
+  restored`), nor when the model isn't the one the look was kept on (`... the look kept was on model ...: not
+  restored`; the model itself is never put back).
+- *Tests.* net_test 19 (the cap: a 4th player refused, the clients learn the cap, a leaver makes room, clamped);
+  clothing_test (`WornSettle`, `DressDiff`, `NotWorn`).
+
+**The host's mission car a player sits in** (MJQ's Vice Kings 2 report: on the client the host and Aisha stood up
+through the car, then the client hit an invisible car and a copy of the host's car appeared; research
+notes/coop-3/activity_car_research.md, mjq_fixes_b_notes.md). With `mission_cars = 0` the host's mission cars were
+left out of the stream: the client showed the host's car as a pose copy made inside its own mission's twin, with no
+passengers, and Aisha's copy froze at the door.
+- *Streamed once a player sits in it* (mod.ini `player_mission_cars`, 1). `WorldRefresh`: a `world_mission_cars`
+  entry (not a shared mirror's) whose `driver_of` is a player goes into `world_player_mission_cars` and streams to
+  the mission's end whatever `mission_cars` says (only while its script hides it and nobody is in it it is left out).
+  The pose carries it, its create carries the crew; the member adopts its pose copy (`WorldAdoptCar`). A story
+  character seated in it isn't held back by 2.1's named rule.
+- *The twin hidden.* `ShareMissionCars` lists those cars with `a[0] | 1 << 9` (no new event) whenever the mission's vehicles don't all stream. A member pairs them with any
+  `mission_cars` setting: its own mission car of the model nearest to where the host's car was first seen here or is
+  now, within 25 m (`cw::PickTwin`), hidden with 82538A90 as 2.4 does, and kept hidden while listed (no 3 s rule; shown
+  again at the mission's end). For both kinds of list the host's car counts as shown when `FindCar` finds it (a car copy
+  a pose made too, not only a world copy: a copy let go into `car_copies` used to show the twin again).
+- *Hidden cars aren't solid* (mod.ini `hidden_cars_ghost`, 1). 82538A90 takes a hidden car out of the collisions
+  only while it is in the world (`+120 0x04000000`): the vehicle vtable+28 `82533740` -> vtable+24 `825338C8` sets the
+  body's filter (`*(v+244)+56`) to the no-collision `*0x827E7A20` and keyframes it. A car hidden outside the world
+  (the client's own copy of a mission's chase vehicles, hidden at its group's create far off) stayed solid once its
+  chunk loaded. Once a second a member gives the same call (`CarUnsolid`) to each hidden car of its mirrored mission
+  (`own_mission_cars`) and each twin it hid, when in the world with a solid body; a car it made unsolid that is shown
+  again outside the world gets the shown call once it is back in (`CarsSolidAgain`: once a second in every role, so
+  also after this game became the mission host, and at once when a twin is shown; 256 remembered at most, logged once
+  when full). Only on the known path (vtable+28 `82533740`, `+54664` / `+54684` clear).
+- *Crew without its car.* `Scheduler::PlanMember`: a seated person whose car isn't a candidate and that the member
+  holds while it doesn't hold the car (left out, declined) is removed there (reason 0) and offered again with its car
+  or on foot; one in a car the member holds keeps it as before. Only a car of this owner's registry counts: a person
+  in one it doesn't know (a pose's car copy, another owner's car) isn't seated for the plan and streams on foot as
+  before. The owner's 10 s line adds `crew without its car N
+  entry-ticks, removed for it N`.
+- *The seat reset beside the car.* The reset after two refused seat tries puts the character 1.6 m out along the
+  car's right row (+32), on the side it stood, else the seat's (0 and 2 on the negative side), not at the car's
+  origin (which stood it in the body).
+- *Tests.* world_test 7b (a person on foot that sits in a left-out car is removed at once, comes back after its car;
+  in a held car that is inactive for 2 s it stays, it goes with the car after kInactiveMs), 7c (`PickTwin`), 7d (a
+  person in a car not in the registry isn't removed, it streams on foot).
+
+**Emotes and voice lines, protocol 13** (MJQ: "some emotes don't show on the other screen, voice lines don't work at
+all"; research notes/coop-3/emotes_voice_research.md, mjq_fixes_c_notes.md). Two new event kinds, so `kVersion` is 13:
+a protocol 12 build is refused at join.
+- *The emote's set* (mod.ini `emote_sets`, 1). Most of the SR Tweak Menu's emotes (most poses, every prop emote) are
+  states and actions of another animation set: the menu writes that set's entry (12 B at 0x82C06D58, +0 the name,
+  count *0x8370DB74) on the player's animation instance `*(+568)+4` while the emote plays. The character in the other
+  games tried them with its own set (state refused, "Action N: refused"). `kEventAnimSet` = 52 carries the set
+  (`cw::PackAnimSet`: its index, its name's hash, borrowed = not the definition's set (+228, +20) nor a menu `SRT_`
+  set), on a change at once (`WatchLocalAnim`: before the state's `kEventAnim` 250 ms later; `PlayActionHook`: before
+  the `kEventAction`), and every 5 s. The receiver finds it by index when the name matches, else by name, and
+  borrows it on the character before their state (UpdateAvatar) or action (`227 + n`) plays, even when the
+  character's own set has it (the prop comes with the other set's state); not when that set lacks it too
+  (`BorrowEmoteSet`). Its own set goes back (`EndEmoteSet`: StopMoves when something of it still plays, else
+  82440200) when theirs changes, when nothing of theirs has played for 2 s, and when the character goes (a pool
+  character goes back with its own). The pose refusals are logged now (once per player and state), and a refused
+  action says why. `82444F88(player, -1)` is no longer sent.
+- *Held tracks.* A file emote plays with 826F5C20 flag 17 (held: full weight after its end). 826F5BC0 / 826F5B88 skip
+  held tracks, so each one played on a character stayed frozen there (after nine none started). Its handle is kept and
+  the track's held bit cleared (ap+7260+idx*84 +16, when +0 is its id and 0x400 is set) before the next one and in
+  `StopMoves`, as the menu's `free_held_tracks` does. A custom animation not loaded here is tried again every 5 s while
+  they play it (was: never after 3 misses).
+- *Voice lines* (mod.ini `voice_sync`, 1). Every line ends in SAY_LINE 82219298(human, situation, r5, r6 sound set,
+  r7 distance class): pain, death, combat, script and Tweak Menu lines, all on the local player. `SayLineHook`: a
+  line our player said (it returned 1) goes as `kEventVoice` = 51 (`cw::PackVoice`: situation, the persona's index in
+  0x82B3E420 (960 B each, count *0x82B3E41C, +0 its name) and name hash, r5-r7) to the players within 170 m
+  (`cw::VoiceInRange`, the relay's second tier; one event to everyone when all are), at most 4 a second and no repeat
+  of a situation within 300 ms (`cw::VoiceGate`). There the character takes that persona (+3552; a gang voice from the
+  menu's Voice page goes too) and says it: SAY_LINE on the character, so from where it stands, culled by that game's
+  listener, with its talking face (+224 0 around the call). At most 6 a second per player there; none while the
+  character is hidden for a cutscene. The characters' own lines are refused (a replayed hit with a persona said its
+  pain twice). The persona is put back when the character goes.
+- Lines `Player N emote set: PML1`, `emote N: their set borrowed here`, `emote set put back (...)`, `pose N refused
+  here: ...`, `custom animation X isn't loaded here: tried again every 5 s ...`, `Player N voice: BM_VK1`, `said line N
+  (...): said here / not said here`; the 30 s `Emote sets:` and `Voice:` counts.
+- *Tests.* net_test 20 (both events pack and back, refusals, the gate, the range, and through the session: the set
+  before its action, the line to its target only).
+
+*Settings* (mod.ini)
+- `max_players = 8` (the line missing is 8; 2-12; the session host's counts): the player cap above.
+- `emote_sets = 1` (the line missing is 1): the emote's set and the held tracks above. `0`: no set sent or borrowed,
+  only emotes in the character's own set show (and file emotes' held tracks stay, as before).
+- `voice_sync = 1` (the line missing is 1): voice lines above. `0`: none sent or said here, other players' characters
+  stay silent (their own lines are not refused either).
+- `player_mission_cars = 1` (the line missing is 1; the host streams, a member hides its twin): the host's mission car
+  a player sits in above. `0`: as 2.4.
+- `hidden_cars_ghost = 1` (the line missing is 1): hidden cars out of the collisions above. `0`: as the game leaves
+  them.
+- `look_restore = 1` (the line missing is 1): the look kept through the game's reverts above. `0`: the reverts are
+  left as they are (the save's look).
+- `pose_tiers = 1` (the line missing is 1; the session host's setting counts): the relay's tiers above. `0`: every
+  pose to everyone (to tell a tier problem from another).
+- `send_pacing_ms = 10` (the line missing is 10; 0-50): the pacing above. `0`: a packet whenever something is queued.
+- `player_list = 1` (the line missing is 1): hold Back for the player list. `0`: Back is never taken, it passes to
+  the game as before.
+- `clothing_pool = 1` (the line missing is 1): the clothing pool above. `0`: a full set per player-pool slot, as 2.4,
+  plus the worn-piece guard (L7 above).
+- `view_holds = 1` (the line missing is 1): the fades fixes' holds and the member's off-screen and lying-body rules.
+  `0`: copies fade when their game removes them, as coop3-7 (to tell a fades problem from a 2.4 one).
+- `audio_repair = 1` (the line missing is 1): the unlock popup's sound pause handed back, the watchdog's repairs and
+  the safe points above, and co-op's cutscene end held for its start's begin. `0`: the `Sound pause count` lines only
+  (to tell a sound problem from the repair), the end at once.
+- `climb_sync = 1` (the line missing is 1): players' climbs sent and replayed (above). `0`: no `kEventClimb` sent or
+  replayed, and their climb states play on the character as before 3.0 (no fallback, no jump end on 6/E or 0/0,
+  Drive's >2 m/s release as before).
+- `own_body_slots = 2` (the line missing is 2; 0-11; with `own_body = 1`): the body block's load slots (memory step 1
+  above): the first K other players get their own body shape, K x 1.46 MB set aside at the first join. `0`: own body
+  off (`own_body = 0`). `11`: the old 16 MB block.
+- `own_body_max = 0` (the line missing is 0; with `own_body = 1`): with more players than this in the session at the
+  first join (on the host of a session over half this size, 5 s after the first character asked for its body), no body block: everyone shows this game's body shape
+  (the body block above). `0`: no limit (coop3-21 shipped 6, when the block was always 16 MB).
+- `clothing_size_log = 0` (the line missing is 0; 0-1000): the first N clothing picks' item sizes logged (memory step
+  3, phase A).
+- `clothing_item_sized = 0` (the line missing is 0): item-sized clothing buffers (memory step 3, phase B). Turn it on
+  only once the `Clothing size` lines show every item at or under its slot.
+- `clothing_release = 1` (the line missing is 1, as mod.ini ships it): the pool gives memory back (memory low, after
+  a session, after the game's cleanup; fair sharing's free components as spares). `0`: its memory is kept until the game exits, no extras taken off for others, as coop3-14 (to turn it off
+  without a rebuild if a crash or broken textures show up).
+- `world_mode = area` (default; the line missing is area). `shared`: phases 2a, 2b, 2c and 3 above. Set it the same on
+  every game: a game of the other mode gets no world stream and says so in its log.
+- `handover = 1` (shared only; the line missing is 1, as mod.ini ships it): phase 3's hand-over. `0`: copies fade when their owner's player
+  leaves and the new owner spawns its own (2c), to compare.
+- `host_migration = 1` (shared only; the line missing is 1): phase 4's host migration. `0`: the session ends when the
+  host leaves (as in area mode, where it always does). The session host's setting counts: a client turns migration
+  on for the session when its host shares the address list (review_phase4 L9).
+- `puppets = 0` (default; the line missing is 0): 2.4's copies. `1`: puppet copies (above).
+- `world` is gone (1b): 2.2's `world = 0` (2.1's streams instead of the world stream) has no build that reads it; a
+  `world` line left in an old mod.ini is ignored. `traffic` / `peds = own` as above.
