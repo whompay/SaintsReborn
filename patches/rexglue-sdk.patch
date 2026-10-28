@@ -10207,10 +10207,10 @@ index 2b222da..0353440 100644
      case 0x000B0071: {
 diff --git a/src/kernel/xam/apps/xgi_live.inc b/src/kernel/xam/apps/xgi_live.inc
 new file mode 100644
-index 0000000..ad3e2d8
+index 0000000..c7699b5
 --- /dev/null
 +++ b/src/kernel/xam/apps/xgi_live.inc
-@@ -0,0 +1,532 @@
+@@ -0,0 +1,538 @@
 +// Saints Reborn: Xbox Live sessions over Epic Online Services (included by
 +// xgi_app.cpp; only active with the cvar xam_signed_in_to_live).
 +//
@@ -10601,6 +10601,12 @@ index 0000000..ad3e2d8
 +// the higher session id moves, so exactly one of them does. It joins the way
 +// an accepted invite does. 1 = a join was started.
 +extern "C" __declspec(dllexport) int SrMatchmakingMerge() {
++  // OFF since 2026-10-28: the move went through the invite path, so players
++  // were taken out of their own matchmaking into another lobby ("Joining
++  // Blake...") and often stuck on "connecting to invite" when that host was
++  // leaving or moving too. Matchmaking is the game's own again: search, then
++  // host and wait.
++  if (true) return 0;
 +  uint8_t mine[60];
 +  std::map<uint32_t, uint32_t> ctx;
 +  bool alone = false;
