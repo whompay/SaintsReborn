@@ -10210,7 +10210,7 @@ new file mode 100644
 index 0000000..c7699b5
 --- /dev/null
 +++ b/src/kernel/xam/apps/xgi_live.inc
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,612 @@
 +// Saints Reborn: Xbox Live sessions over Epic Online Services (included by
 +// xgi_app.cpp; only active with the cvar xam_signed_in_to_live).
 +//
@@ -10437,6 +10437,64 @@ index 0000000..c7699b5
 +// 60, open/filled public/private slots, property / context counts and
 +// pointers) + their XUSER_PROPERTY (24 bytes, value at +8) and XUSER_CONTEXT
 +// (8 bytes) arrays at the end of the buffer. Returns the number written.
++// Matchmaking level filter (game sub_823630B0, loop at 0x82363440, for each
++// search result): the host's level id (property 0x10000035, low 16 bits) must
++// be a level of the search's mode [0x827AD2F0] in this game's level table
++// (sub_82373788: counts [[0x83074B1C] + slot * 4], records [[0x83074B20] +
++// slot * 4], 60 bytes, id at +36; slot = (mode + 243) & 0xFF) and, when this
++// game's own level setting [0x83A20830] is above 1, in this game's playlist
++// for the mode with its flag set (sub_82373930: 0x8307B0C8 + slot * 4 count,
++// + (slot + 7) * 4 id array, + (slot + 14) * 4 flag array). A result that
++// fails is skipped without a word and the game hosts its own lobby instead:
++// with map packs (public lobbies switch their levels off), Zombies, or a level
++// left over from a custom lobby, players found each other's lobby over and
++// over and all kept hosting - "Finding matches" forever (2026-10-28).
++template <class Mem>
++bool LevelPassesFilter(Mem* memory, int32_t id) {
++  auto r32 = [&](uint32_t a) { return rex::memory::load_and_swap<uint32_t>(memory->template TranslateVirtual<uint8_t*>(a)); };
++  auto r16 = [&](uint32_t a) { return rex::memory::load_and_swap<uint16_t>(memory->template TranslateVirtual<uint8_t*>(a)); };
++  auto r8 = [&](uint32_t a) { return *memory->template TranslateVirtual<uint8_t*>(a); };
++  const uint32_t mode = r32(0x827AD2F0u);
++  if (mode < 13 || mode >= 20 || int16_t(id) == -1) return false;
++  const uint32_t slot = (mode + 243) & 0xFF;
++  const uint32_t counts = r32(0x83074B1Cu), records = r32(0x83074B20u);
++  if (counts < 0x40000000u || records < 0x40000000u) return false;
++  const uint32_t n = r32(counts + slot * 4), recs = r32(records + slot * 4);
++  if (recs < 0x40000000u) return false;
++  bool found = false;
++  for (uint32_t i = 0; i < n && i < 256 && !found; ++i) found = int16_t(r16(recs + i * 60 + 36)) == int16_t(id);
++  if (!found) return false;
++  if (int32_t(r32(0x83A20830u)) <= 1) return true;
++  const uint32_t pl = 0x8307B0C8u;
++  const uint32_t pn = r32(pl + slot * 4), ids = r32(pl + (slot + 7) * 4), flags = r32(pl + (slot + 14) * 4);
++  if (ids < 0x40000000u || flags < 0x40000000u) return false;
++  for (uint32_t i = 0; i < pn && i < 256; ++i)
++    if (int16_t(r16(ids + i * 2)) == int16_t(id)) return r8(flags + i) != 0;
++  return false;
++}
++// A level id this game's filter takes for the lobby of a host on a disc map
++// (ids below 1000: every game has them): its own level setting if that
++// passes, else the first level of the mode that does. -1 = none.
++template <class Mem>
++int32_t LevelForFilter(Mem* memory) {
++  auto r32 = [&](uint32_t a) { return rex::memory::load_and_swap<uint32_t>(memory->template TranslateVirtual<uint8_t*>(a)); };
++  auto r16 = [&](uint32_t a) { return rex::memory::load_and_swap<uint16_t>(memory->template TranslateVirtual<uint8_t*>(a)); };
++  const int32_t own = int32_t(r32(0x83A20830u));
++  if (own > 1 && LevelPassesFilter(memory, own)) return own;
++  const uint32_t mode = r32(0x827AD2F0u);
++  if (mode < 13 || mode >= 20) return -1;
++  const uint32_t slot = (mode + 243) & 0xFF;
++  const uint32_t counts = r32(0x83074B1Cu), records = r32(0x83074B20u);
++  if (counts < 0x40000000u || records < 0x40000000u) return -1;
++  const uint32_t n = r32(counts + slot * 4), recs = r32(records + slot * 4);
++  if (recs < 0x40000000u) return -1;
++  for (uint32_t i = 0; i < n && i < 256; ++i) {
++    const int32_t id = int16_t(r16(recs + i * 60 + 36));
++    if (id >= 0 && id < 1000 && LevelPassesFilter(memory, id)) return id;
++  }
++  return -1;
++}
++
 +template <class Mem>
 +uint32_t FillSearchResults(Mem* memory, uint32_t results_ptr, uint32_t buffer_size,
 +                           uint32_t max_results, uint32_t num_ctx, uint32_t ctx_ptr, const char* what,
@@ -10530,7 +10588,23 @@ index 0000000..c7699b5
 +      uint8_t* pr = base + cursor;
 +      rex::memory::store_and_swap<uint32_t>(pr, id);
 +      pr[8] = uint8_t(id >> 28);  // XUSER_DATA type is the property id's top nibble
-+      std::memcpy(pr + 16, bytes.data(), bytes.size());  // XUSER_DATA value (big endian) at +8 of XUSER_DATA
++      std::vector<uint8_t> value = bytes;
++      // The host's level for the game's lobby filter (see LevelPassesFilter):
++      // a lobby on a disc map is always joinable - the match itself is played
++      // on the host's level, the filter only decides whether to try.
++      if (!session_id && id == 0x10000035u && value.size() == 4) {
++        const int32_t theirs = int32_t(uint32_t(value[0]) << 24 | uint32_t(value[1]) << 16 | uint32_t(value[2]) << 8 | value[3]);
++        const int32_t level = int16_t(theirs);
++        if (level < 1000 && !LevelPassesFilter(memory, level)) {  // disc map, or none / random yet (-1)
++          const int32_t use = LevelForFilter(memory);
++          if (use >= 0) {
++            for (int k = 0; k < 4; ++k) value[k] = uint8_t(uint32_t(use) >> (24 - 8 * k));
++            REXLOG_INFO("LIVE {}: {}'s lobby is on level {}, which this game's lobby filter skips - shown as level {} so "
++                        "it can be joined", what, a.name, level, use);
++          }
++        }
++      }
++      std::memcpy(pr + 16, value.data(), value.size());  // XUSER_DATA value (big endian) at +8 of XUSER_DATA
 +      cursor += 24;
 +    }
 +    rex::memory::store_and_swap<uint32_t>(r + 88, a.contexts.empty() ? 0 : results_ptr + cursor);
