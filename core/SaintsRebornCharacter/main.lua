@@ -57,6 +57,19 @@ local function slider_value(p) return ROWS.value(p, ROWS.BODY_TYPE) end
 local MOVE = nil   -- movement_style.lua, loaded below
 local MENU = require("movement_menu")
 local LISTS = require("row_lists")
+-- Files from two versions (an update cut short, or a synced folder such as
+-- OneDrive bringing an older file back): af8e127's main.lua with a
+-- movement_menu.lua that has no SCREENS hooked the creator and then failed,
+-- so every key in the creator ran into "attempt to index a nil value (field
+-- 'SCREENS')" and the creator stopped working until a reinstall. Now nothing
+-- is hooked: the creator works without this mod's extras, and the log says
+-- what to do.
+if type(MENU) ~= "table" or type(MENU.SCREENS) ~= "table" or not MENU.SCREENS.creator
+    or not MENU.SCREENS.surgeon then
+  wml.log("Saints Reborn character: movement_menu.lua is from another version than main.lua - mod off, "
+          .. "the creator works without it. Run SaintsReborn-Updater to repair the files.")
+  return
+end
 local PERS = nil  -- personality.lua, loaded below
 
 -- ------------------------------------------------------------ older saves
