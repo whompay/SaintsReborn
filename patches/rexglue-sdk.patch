@@ -10595,7 +10595,7 @@ index 0000000..c7699b5
 +      if (!session_id && id == 0x10000035u && value.size() == 4) {
 +        const int32_t theirs = int32_t(uint32_t(value[0]) << 24 | uint32_t(value[1]) << 16 | uint32_t(value[2]) << 8 | value[3]);
 +        const int32_t level = int16_t(theirs);
-+        if (level < 1000 && !LevelPassesFilter(memory, level)) {  // disc map, or none / random yet (-1)
++        if (false && level < 1000 && !LevelPassesFilter(memory, level)) {  // OFF: ids < 1000 are not always disc maps (map packs use them too) - a player joined a map he did not have and got a black void
 +          const int32_t use = LevelForFilter(memory);
 +          if (use >= 0) {
 +            for (int k = 0; k < 4; ++k) value[k] = uint8_t(uint32_t(use) >> (24 - 8 * k));
