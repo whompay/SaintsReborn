@@ -12257,7 +12257,7 @@ index 8778066..9f0a56e 100644
    return X_ERROR_SUCCESS;
  }
  
-@@ -595,6 +632,401 @@ class XStaticAchievementEnumerator : public XEnumerator {
+@@ -595,6 +632,424 @@ class XStaticAchievementEnumerator : public XEnumerator {
    size_t current_item_ = 0;
  };
  
@@ -12522,7 +12522,30 @@ index 8778066..9f0a56e 100644
 +  const uint32_t nx = std::min<uint32_t>(num_xuids, 100);
 +  for (uint32_t i = 0; i < nx && xuids_ptr; ++i)
 +    request += fmt::format(" {:016x}", memory::load_and_swap<uint64_t>(mem->TranslateVirtual(xuids_ptr + i * 8)));
-+  const auto answer = QueryStats(request);
++  // Reads that include a skill view (0xFFFFxxxx, TrueSkill: read when a Ranked
++  // match is set up, and on some STATISTICS pages) are answered here at once
++  // with a zero row per player for the other views - what the server answered
++  // before anyone had stats. 2026-10-28: once real stats came back (after a 1 s
++  // wait on the game thread) the host ended every Ranked match right after it
++  // started ("You lost").
++  bool skill = false;
++  for (const auto& s : specs) skill = skill || (s.view >> 16) == 0xFFFFu;
++  std::vector<StatsView> answer;
++  if (skill) {
++    for (const auto& s : specs) {
++      if ((s.view >> 16) == 0xFFFFu) continue;
++      StatsView v;
++      v.view = s.view;
++      for (uint32_t i = 0; i < nx && xuids_ptr; ++i) {
++        StatsRow r;
++        r.xuid = memory::load_and_swap<uint64_t>(mem->TranslateVirtual(xuids_ptr + i * 8));
++        v.rows.push_back(std::move(r));
++      }
++      answer.push_back(std::move(v));
++    }
++  } else {
++    answer = QueryStats(request);
++  }
 +  FillStats(results_ptr, mem->TranslateVirtual<uint8_t*>(results_ptr), results_size, specs, answer, nx);
 +  static std::atomic<int> told{0};
 +  if (told++ < 40) REXLOG_INFO("LIVE XUserReadStats '{}':{}", request, DescribeAnswer(answer));
@@ -12659,7 +12682,7 @@ index 8778066..9f0a56e 100644
  u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                               u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                               mapped_u32 handle_ptr) {
-@@ -761,7 +1193,7 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
+@@ -761,7 +1216,7 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
  REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
  REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
  REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
