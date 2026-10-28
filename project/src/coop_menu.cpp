@@ -268,13 +268,15 @@ void SetPlayerName(const std::string& name) {
 // the host's countdown starts once this many players are connected
 // (console var mp_auto_mm_conn_needed, int 0x827ADF04, game default 4;
 // sub_82362108). Set in MULTIPLAYER > OPTIONS, kept in mp_min_players.txt
-// next to the exe. Only the host's value counts.
+// next to the exe. Only the host's value counts. Default 2 since 2026-10-28
+// (with few players online, hosts on 4 or 7 waited forever); and a host with
+// 2+ players starts after 60 s whatever this says (kMatchWaitMs below).
 constexpr uint32_t kMinPlayersVar = 0x827ADF04u;
 constexpr int kMinPlayersLow = 1, kMinPlayersHigh = 12;  // 1 = start alone
 int g_min_players = 0;  // 0 = not loaded yet
 int MinPlayers() {
   if (g_min_players) return g_min_players;
-  int v = 4;  // the game's own default (mp_auto_mm_conn_needed)
+  int v = 2;  // Saints Reborn default (the game's own mp_auto_mm_conn_needed is 4)
   if (FILE* f = std::fopen("mp_min_players.txt", "rb")) {
     int x = 0;
     if (std::fscanf(f, "%d", &x) == 1 && x >= kMinPlayersLow && x <= kMinPlayersHigh) v = x;
@@ -297,8 +299,12 @@ void SetMinPlayers(int v) {
 constexpr uint32_t kLobbyKindVar = 0x827AD564u;  // 0 custom, 1 player match, 2 ranked, 3 system link
 constexpr int kRankedMinPlayers = 2;
 bool RankedLobby(uint8_t* base) { return R32(base, kLobbyKindVar) == 2; }
+// Set by SoloStartPoll once a hosted matchmade lobby has had 2+ players for
+// kMatchWaitMs: "Players to Start" no longer holds the match back.
+std::atomic<int> g_mm_need_override{0};
 int EffectiveMinPlayers(uint8_t* base) {
-  const int v = MinPlayers();
+  const int forced = g_mm_need_override.load();
+  const int v = forced ? std::min(MinPlayers(), forced) : MinPlayers();
   return RankedLobby(base) ? std::max(v, kRankedMinPlayers) : v;
 }
 void ApplyMinPlayers(uint8_t* base) {
@@ -1419,6 +1425,7 @@ bool sr::CoopResumePulse() {
 // their own. A host alone now waits 20 s, so searching players can still
 // find this game first.
 constexpr uint32_t kSoloStartWaitMs = 20000;
+constexpr uint32_t kMatchWaitMs = 60000, kMatchCountdownMs = 10000;
 void SoloStartPoll(uint8_t* base) {
   constexpr uint32_t kMm = 0x8370EB4Fu, kStartAt = 0x8282B708u, kClock = 0x827AA6E0u;
   ApplyMinPlayers(base);  // keeps ranked at 2+ even if the lobby kind changed after the menus were built
@@ -1430,7 +1437,10 @@ void SoloStartPoll(uint8_t* base) {
   const int32_t start_at = int32_t(R32(base, kStartAt));
   const uint32_t clock = R32(base, kClock);
   const int64_t left = start_at >= 0 ? int64_t(start_at) - int64_t(clock) : -1;
-  if (!screen) return;
+  if (!screen) {
+    g_mm_need_override.store(0);  // left matchmaking: "Players to Start" counts again
+    return;
+  }
   {
     static auto next = std::chrono::steady_clock::time_point{};
     const auto now = std::chrono::steady_clock::now();
@@ -1440,8 +1450,10 @@ void SoloStartPoll(uint8_t* base) {
                   mm_host, searching, hosting_mm, count, need, start_at, left);
     }
   }
-  if (!(mm_host || (searching && hosting_mm))) return;
-  if (!MatchmadeLobby(base)) return;
+  if (!(mm_host || (searching && hosting_mm)) || !MatchmadeLobby(base)) {
+    g_mm_need_override.store(0);
+    return;
+  }
   // Hosting alone: move into another host waiting for the same match
   // (xgi_live.inc SrMatchmakingMerge decides; one of two lone hosts moves).
   if (count <= 1) {
@@ -1455,6 +1467,29 @@ void SoloStartPoll(uint8_t* base) {
         return m ? reinterpret_cast<MergeFn>(GetProcAddress(m, "SrMatchmakingMerge")) : nullptr;
       }();
       if (merge && merge()) return;
+    }
+  }
+  // 2+ players for 60 s: start whatever "Players to Start" says (2026-10-28:
+  // hosts on 4 / 7 kept 2-6 players on "Finding matches" forever). The need
+  // drops to 2 (the game's own join / leave handling then agrees) and, if the
+  // game has no start time, the normal 10 s countdown begins, so late joiners
+  // still get in.
+  {
+    static auto wait_since = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (count >= 2 && need > 2) {
+      if (wait_since == std::chrono::steady_clock::time_point{}) wait_since = now;
+      if (now - wait_since >= std::chrono::milliseconds(kMatchWaitMs)) {
+        g_mm_need_override.store(2);
+        ApplyMinPlayers(base);
+        if (int32_t(R32(base, kStartAt)) < 0) W32(base, kStartAt, (clock + kMatchCountdownMs) % 0x6B49D200u);
+        REXLOG_INFO("Matchmaking: {} players waited {} s (Players to Start {}): match starts in {} s", count,
+                    kMatchWaitMs / 1000, need, kMatchCountdownMs / 1000);
+        wait_since = {};
+        return;
+      }
+    } else if (count < 2) {
+      wait_since = {};
     }
   }
   // Only a host alone with "Players to Start: 1": with more players the

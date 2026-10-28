@@ -9761,10 +9761,10 @@ index 3f9422d..943eea5 100644
  
  void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
-index 2b222da..1b58324 100644
+index 2b222da..0353440 100644
 --- a/src/kernel/xam/apps/xgi_app.cpp
 +++ b/src/kernel/xam/apps/xgi_app.cpp
-@@ -10,9 +10,38 @@
+@@ -10,9 +10,43 @@
   */
  
  #include <rex/kernel/xam/apps/xgi_app.h>
@@ -9782,6 +9782,11 @@ index 2b222da..1b58324 100644
 +REXCVAR_DECLARE(bool, xam_signed_in_to_live);
 +namespace rex::kernel::xam {
 +void LiveFillSessionInfo(uint8_t* info);
++// Leaderboards (xam_user.cpp).
++uint32_t LiveStatsRead(uint32_t num_xuids, uint32_t xuids_ptr, uint32_t num_specs, uint32_t specs_ptr,
++                       uint32_t results_size, uint32_t results_ptr);
++void LiveStatsWrite(uint32_t session_obj, uint64_t xuid, uint32_t num_views, uint32_t views_ptr,
++                    uint32_t session_flags, int others, bool ranked);
 +}
 +namespace {
 +bool LiveTraceOnce(uint32_t app, uint32_t message) {
@@ -9803,7 +9808,7 @@ index 2b222da..1b58324 100644
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -29,6 +58,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -29,6 +63,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                        uint32_t buffer_length) {
    // NOTE: buffer_length may be zero or valid.
    auto buffer = memory_->TranslateVirtual(buffer_ptr);
@@ -9816,7 +9821,7 @@ index 2b222da..1b58324 100644
    switch (message) {
      case 0x000B0006: {
        assert_true(!buffer_length || buffer_length == 24);
-@@ -40,6 +75,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -40,6 +80,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
        uint32_t context_id = memory::load_and_swap<uint32_t>(buffer + 16);
        uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
@@ -9831,7 +9836,7 @@ index 2b222da..1b58324 100644
        REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                      context_value);
        return X_E_SUCCESS;
-@@ -49,6 +92,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -49,6 +97,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t property_id = memory::load_and_swap<uint32_t>(buffer + 16);
        uint32_t value_size = memory::load_and_swap<uint32_t>(buffer + 20);
        uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
@@ -9844,7 +9849,7 @@ index 2b222da..1b58324 100644
        REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                      value_size, value_ptr);
        return X_E_SUCCESS;
-@@ -113,6 +162,76 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -113,6 +167,76 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
            "{:08X})",
            session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
            nonce_ptr);
@@ -9921,7 +9926,7 @@ index 2b222da..1b58324 100644
        return X_E_SUCCESS;
      }
      case 0x000B0011: {
-@@ -123,7 +242,47 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -123,7 +247,47 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
  
        REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
@@ -9970,7 +9975,7 @@ index 2b222da..1b58324 100644
        return X_E_SUCCESS;
      }
      case 0x000B0012: {
-@@ -138,6 +297,20 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -138,6 +302,20 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
                      is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                      user_count, xuid_array_ptr, user_index_array, private_slots_array);
@@ -9991,7 +9996,7 @@ index 2b222da..1b58324 100644
        return X_E_SUCCESS;
      }
      case 0x000B0014: {
-@@ -179,6 +352,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -179,6 +357,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                      user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                      results_buffer_size, search_results_ptr);
@@ -10001,7 +10006,7 @@ index 2b222da..1b58324 100644
        return X_E_SUCCESS;
      }
      case 0x000B0018: {
-@@ -214,6 +390,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -214,6 +395,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                      proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                      results_buffer_size, search_results_ptr, num_users);
  
@@ -10011,7 +10016,7 @@ index 2b222da..1b58324 100644
        return X_E_SUCCESS;
      }
      case 0x000B001D: {
-@@ -271,24 +450,69 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -271,24 +455,69 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                      obj_ptr, flags, session_nonce, session_duration_sec, results_buffer_size,
                      results_ptr);
  
@@ -10096,7 +10101,100 @@ index 2b222da..1b58324 100644
        return X_E_SUCCESS;
      }
      case 0x000B001F: {
-@@ -439,6 +663,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -317,41 +546,70 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       return X_E_SUCCESS;
+     }
+     case 0x000B0021: {
+-      assert_true(!buffer_length || buffer_length == 28);
+-
+-      uint32_t title_id = memory::load_and_swap<uint32_t>(buffer + 0);
++      // XUserReadStats(title, xuid count, xuids, spec count, specs, results
++      // size, results) (sub_827169A0; it checked the size already): these
++      // players' rows from the Saints Reborn leaderboards (xam_user.cpp).
++      if (!buffer || buffer_length < 28) return X_E_INVALIDARG;
+       uint32_t xuids_count = memory::load_and_swap<uint32_t>(buffer + 4);
+       uint32_t xuids_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
+       uint32_t specs_count = memory::load_and_swap<uint32_t>(buffer + 12);
+       uint32_t specs_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
+       uint32_t results_size = memory::load_and_swap<uint32_t>(buffer + 20);
+       uint32_t results_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
+-
+-      REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
+-                    xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
+-
+-      return X_E_SUCCESS;
++      return LiveStatsRead(xuids_count, xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
+     }
+     case 0x000B0025: {
+-      assert_true(!buffer_length || buffer_length == 20);
+-
++      // XSessionWriteStats(session, xuid, view count, views): one player's
++      // results at the end of a match (sub_82387A88 writes a row for every
++      // player) -> Saints Reborn leaderboards (xam_user.cpp LiveStatsWrite),
++      // with what the server needs to know about the session: its flags,
++      // whether it is Ranked and how many other players were in it.
++      // Buffer (24 bytes, seen in the log): +0 session, +4 pad, +8 xuid (u64,
++      // 8-aligned), +16 view count, +20 XSESSION_VIEW_PROPERTIES*. Reading
++      // the xuid at +4 sent every write out empty ("OK 0 0").
++      if (!buffer || buffer_length < 24) return X_E_INVALIDARG;
+       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
+-      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
+-      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
+-
+-      REXKRNL_DEBUG("XSessionWriteStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
+-                    views_ptr);
+-
++      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 8);
++      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 16);
++      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
++      uint32_t session_flags = 0;
++      int others = 0;
++      bool ranked = false;
++      {
++        std::lock_guard<std::mutex> l(g_live.mutex);
++        for (const auto& e : g_live.sessions)
++          if (e.obj == obj_ptr) {
++            session_flags = e.flags;
++            others = e.remote;
++          }
++        auto it = g_live.contexts.find(kContextGameType);
++        ranked = (session_flags & kFlagArbitration) || (it != g_live.contexts.end() && it->second == 0);
++      }
++      // Players in the match: the game's own list (the one the arbitration
++      // answer above walks): circular, head at [0x83061938], XUID at +0x21E68,
++      // next at +0x21EA4.
++      {
++        std::vector<uint64_t> xuids;
++        const uint32_t head = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(0x83061938u));
++        uint32_t p = head;
++        for (uint32_t guard = 0; p >= 0x10000 && guard < 64; ++guard) {
++          const uint64_t x = memory::load_and_swap<uint64_t>(memory_->TranslateVirtual(p + 0x21E68u));
++          if (x && std::find(xuids.begin(), xuids.end(), x) == xuids.end()) xuids.push_back(x);
++          const uint32_t next = memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(p + 0x21EA4u));
++          if (next == head || next == p) break;
++          p = next;
++        }
++        others = std::max(others, int(xuids.size()) - 1);
++      }
++      LiveStatsWrite(obj_ptr, xuid, num_views, views_ptr, session_flags, others, ranked);
+       return X_E_SUCCESS;
+     }
+     case 0x000B0026: {
+-      assert_true(!buffer_length || buffer_length == 20);
+-
++      if (!buffer || buffer_length < 24) return X_E_SUCCESS;
+       uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 4);
+-      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
+-      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
++      uint64_t xuid = memory::load_and_swap<uint64_t>(buffer + 8);
++      uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 16);
++      uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
+ 
+       REXKRNL_DEBUG("XSessionFlushStats({:08X}, {:016X}, {:08X}, {:08X})", obj_ptr, xuid, num_views,
+                     views_ptr);
+@@ -439,6 +697,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
            non_weighted_search_properties_ptr, non_weighted_search_contexts_ptr, results_buffer_size,
            search_results_ptr, num_users, weighted_search);
  
@@ -12067,14 +12165,21 @@ index 9abcef6..feec2b3 100644
    // Handle ref is incremented, so return that.
    uint32_t handle = listener->handle();
 diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
-index 8778066..62a577c 100644
+index 8778066..9f0a56e 100644
 --- a/src/kernel/xam/xam_user.cpp
 +++ b/src/kernel/xam/xam_user.cpp
-@@ -14,8 +14,11 @@
+@@ -14,8 +14,18 @@
  
  #include <cstring>
  
++#include <algorithm>
 +#include <atomic>
++#include <map>
++#include <thread>
++#include <mutex>
++#include <chrono>
++#include <string>
++#include <vector>
 +
  #include <rex/cvar.h>
  #include <rex/kernel/xam/private.h>
@@ -12082,7 +12187,7 @@ index 8778066..62a577c 100644
  #include <rex/logging.h>
  #include <rex/math.h>
  #include <rex/hook.h>
-@@ -30,6 +33,12 @@
+@@ -30,6 +40,16 @@
  
  REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
  
@@ -12090,12 +12195,16 @@ index 8778066..62a577c 100644
 +
 +namespace rex::system::online {
 +uint64_t OnlineXuid();  // online_identity.cpp
++bool Modded();
++bool LiveStatsPost(const std::string& path, const std::string& name, const std::string& body, std::string& reply,
++                   int timeout_ms);
++void LiveStatsPostAsync(const std::string& path, const std::string& name, std::string body);
 +}
 +
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -51,6 +60,10 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+@@ -51,6 +71,10 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
        if (type & (2 | 4)) {
          // maybe online profile?
          xuid = user_profile->xuid();
@@ -12106,7 +12215,7 @@ index 8778066..62a577c 100644
          result = X_E_SUCCESS;
        } else if (type & 1) {
          // maybe offline profile?
-@@ -273,6 +286,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+@@ -273,6 +297,11 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
      if (setting && setting->is_set) {
        setting->Append(&out_setting->data, &out_stream);
      }
@@ -12118,7 +12227,7 @@ index 8778066..62a577c 100644
      ++out_setting;
    }
  
-@@ -348,6 +366,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+@@ -348,6 +377,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
            // Data pointer was NULL, so just fill with zeroes
            bytes.resize(binary_size, 0);
          }
@@ -12127,7 +12236,7 @@ index 8778066..62a577c 100644
          user_profile->AddSetting(
              std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
        } break;
-@@ -383,7 +403,13 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+@@ -383,7 +414,13 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
    }
  
    // If we deny everything, games should hopefully not try to do stuff.
@@ -12142,20 +12251,28 @@ index 8778066..62a577c 100644
    return X_ERROR_SUCCESS;
  }
  
-@@ -595,6 +621,72 @@ class XStaticAchievementEnumerator : public XEnumerator {
+@@ -595,6 +632,401 @@ class XStaticAchievementEnumerator : public XEnumerator {
    size_t current_item_ = 0;
  };
  
 +
-+// Leaderboards: XUserCreateStatsEnumeratorByRank / ByXuid (game: sub_82716A88 /
++// Leaderboards over the Saints Reborn server (server/gangs/leaderboards.js;
++// HTTP in online_identity.cpp LiveStatsPost*). Only with xam_signed_in_to_live.
++//
++// Reading: XUserCreateStatsEnumeratorByRank / ByXuid (game: sub_82716A88 /
 +// sub_82716AE8 -> XamUserCreateStatsEnumerator(title, type 1 rank / 0 xuid,
-+// rank or pivot xuid, rows, spec count, specs, *buffer size, *handle)).
++// rank or pivot xuid, rows, spec count, specs, *buffer size, *handle)) and
++// XUserReadStats (xgi_app.cpp, message 0xB0021: friends / own rows).
 +// Results: XUSER_STATS_READ_RESULTS {num_views, views*} -> XUSER_STATS_VIEW
-+// {view_id, total_rows, num_rows, rows*} -> XUSER_STATS_ROW (48 B: xuid, rank,
-+// rating i64 @16, gamertag[16] @24, num_columns @40, columns* @44) ->
-+// XUSER_STATS_COLUMN (24 B: column id u16, XUSER_DATA @8: type u8, value @8).
-+// For now every view comes back empty (no online stats service yet); the
-+// Epic Online Services backend fills rows later.
++// {view_id, total_rows, num_rows, rows*} -> XUSER_STATS_ROW (48 B: xuid, rank
++// @8, rating i64 @16, gamertag[16] @24, num_columns @40, columns* @44) ->
++// XUSER_STATS_COLUMN (24 B: column id u16, XUSER_DATA @8: type u8 @8, value @16).
++// The title library sizes buffers as 8 + views * (16 + rows * 52) + rows *
++// columns * 28 (sub_827169A0), so the 48 / 24 byte records always fit.
++//
++// Writing: XSessionWriteStats (xgi_app.cpp, message 0xB0025) ->
++// LiveStatsWrite: XSESSION_VIEW_PROPERTIES {view, num props, props*} ->
++// XUSER_PROPERTY (24 B: id, XUSER_DATA @8). Sent in the background.
 +struct X_USER_STATS_SPEC {
 +  rex::be<uint32_t> view_id;
 +  rex::be<uint32_t> num_column_ids;
@@ -12163,49 +12280,370 @@ index 8778066..62a577c 100644
 +};
 +static_assert(sizeof(X_USER_STATS_SPEC) == 136, "XUSER_STATS_SPEC");
 +
++namespace {
++
++constexpr uint16_t kColRank = 0xFFFF, kColRating = 0xFFFE, kColGamertag = 0xFFFD;
++constexpr uint8_t kDataInt32 = 1, kDataInt64 = 2, kDataUnicode = 4;
++
++struct StatsSpec {
++  uint32_t view = 0;
++  std::vector<uint16_t> columns;
++};
++struct StatsRow {
++  uint64_t xuid = 0;
++  uint32_t rank = 0;
++  int64_t rating = 0;
++  std::string name;
++  std::map<uint16_t, std::pair<int64_t, uint8_t>> columns;  // attribute -> value, XUSER_DATA type
++};
++struct StatsView {
++  uint32_t view = 0, total = 0;
++  std::vector<StatsRow> rows;
++};
++
++std::vector<StatsSpec> CopySpecs(uint32_t count, const X_USER_STATS_SPEC* specs) {
++  std::vector<StatsSpec> out;
++  for (uint32_t i = 0; i < count; ++i) {
++    StatsSpec s;
++    s.view = specs[i].view_id;
++    for (uint32_t c = 0; c < std::min<uint32_t>(specs[i].num_column_ids, 64); ++c)
++      s.columns.push_back(specs[i].column_ids[c]);
++    out.push_back(std::move(s));
++  }
++  return out;
++}
++
++std::string SpecViews(const std::vector<StatsSpec>& specs, char sep) {
++  std::string s;
++  for (const auto& sp : specs) {
++    if (!s.empty()) s += sep;
++    s += std::to_string(sp.view);
++  }
++  return s;
++}
++
++std::string MyName() {
++  const auto& profile = REX_KERNEL_STATE()->user_profile();
++  return profile ? profile->name() : std::string("Player");
++}
++
++// Server answer: "V <view> <total> <rows>" then rows
++// "r <xuid> <rank> <rating> <attr hex>=<value>/<type> ... <name>".
++std::vector<StatsView> ParseStats(const std::string& text) {
++  std::vector<StatsView> views;
++  size_t at = 0;
++  while (at < text.size()) {
++    size_t end = text.find('\n', at);
++    if (end == std::string::npos) end = text.size();
++    std::string line = text.substr(at, end - at);
++    at = end + 1;
++    if (!line.empty() && line.back() == '\r') line.pop_back();
++    std::vector<std::string> t;
++    size_t p = 0;
++    while (p < line.size()) {
++      const size_t q = line.find(' ', p);
++      t.push_back(line.substr(p, q == std::string::npos ? std::string::npos : q - p));
++      if (q == std::string::npos) break;
++      p = q + 1;
++    }
++    if (t.size() >= 4 && t[0] == "V") {
++      StatsView v;
++      v.view = uint32_t(std::strtoul(t[1].c_str(), nullptr, 10));
++      v.total = uint32_t(std::strtoul(t[2].c_str(), nullptr, 10));
++      views.push_back(std::move(v));
++    } else if (t.size() >= 4 && t[0] == "r" && !views.empty()) {
++      StatsRow r;
++      r.xuid = std::strtoull(t[1].c_str(), nullptr, 16);
++      r.rank = uint32_t(std::strtoul(t[2].c_str(), nullptr, 10));
++      r.rating = std::strtoll(t[3].c_str(), nullptr, 10);
++      size_t i = 4;
++      for (; i < t.size(); ++i) {
++        const size_t eq = t[i].find('=');
++        if (eq == std::string::npos) break;
++        const size_t slash = t[i].find('/', eq);
++        const uint16_t attr = uint16_t(std::strtoul(t[i].substr(0, eq).c_str(), nullptr, 16));
++        const int64_t value = std::strtoll(t[i].c_str() + eq + 1, nullptr, 10);
++        const uint8_t type = slash == std::string::npos ? kDataInt64 : uint8_t(std::strtoul(t[i].c_str() + slash + 1, nullptr, 10));
++        r.columns[attr] = {value, type == kDataInt32 ? kDataInt32 : kDataInt64};
++      }
++      for (; i < t.size(); ++i) {
++        if (!r.name.empty()) r.name += ' ';
++        r.name += t[i];
++      }
++      views.back().rows.push_back(std::move(r));
++    }
++  }
++  return views;
++}
++
++// Asks the server (blocking, short timeout). Empty views when it can't be reached.
++std::vector<StatsView> QueryStats(const std::string& request) {
++  std::string reply;
++  if (!REXCVAR_GET(xam_signed_in_to_live) ||
++      !rex::system::online::LiveStatsPost("/lb/read", MyName(), request + "\n", reply, 4000)) {
++    static std::atomic<int> told{0};
++    if (REXCVAR_GET(xam_signed_in_to_live) && told++ < 10)
++      REXLOG_WARN("LIVE leaderboards: server not reachable for '{}'", request);
++    return {};
++  }
++  return ParseStats(reply);
++}
++
++uint32_t StatsBufferSize(const std::vector<StatsSpec>& specs, uint32_t rows) {
++  uint64_t size = 8;
++  for (const auto& s : specs) {
++    size += 16 + uint64_t(rows) * (52 + 28 * s.columns.size());
++    for (uint16_t c : s.columns)
++      if (c == kColGamertag) size += uint64_t(rows) * 32;  // the name as UTF-16
++  }
++  return uint32_t(std::min<uint64_t>(size, 0x00FFFFFF));
++}
++
++// Writes XUSER_STATS_READ_RESULTS for specs at guest address base (host data,
++// size bytes). Views come back in spec order; rows that don't fit are dropped.
++void FillStats(uint32_t base, uint8_t* data, uint32_t size, const std::vector<StatsSpec>& specs,
++               const std::vector<StatsView>& answer, uint32_t max_rows) {
++  const uint32_t nviews = uint32_t(specs.size());
++  if (size < 8 + 16 * nviews) return;
++  std::memset(data, 0, size);
++  memory::store_and_swap<uint32_t>(data + 0, nviews);
++  memory::store_and_swap<uint32_t>(data + 4, nviews ? base + 8 : 0);
++  uint32_t free_at = 8 + 16 * nviews;
++  for (uint32_t i = 0; i < nviews; ++i) {
++    const StatsSpec& spec = specs[i];
++    uint8_t* v = data + 8 + i * 16;
++    memory::store_and_swap<uint32_t>(v + 0, spec.view);
++    const StatsView* found = nullptr;
++    for (const auto& a : answer)
++      if (a.view == spec.view) { found = &a; break; }
++    if (!found) continue;
++    memory::store_and_swap<uint32_t>(v + 4, found->total);
++    const uint32_t ncols = uint32_t(spec.columns.size());
++    const bool has_name = std::find(spec.columns.begin(), spec.columns.end(), kColGamertag) != spec.columns.end();
++    const uint32_t per_row = 48 + 24 * ncols + (has_name ? 32 : 0);
++    uint32_t n = std::min<uint32_t>(uint32_t(found->rows.size()), max_rows);
++    if (free_at + uint64_t(n) * per_row > size) n = (size - free_at) / per_row;
++    const uint32_t rows_at = free_at;
++    uint32_t cols_at = rows_at + 48 * n;
++    uint32_t text_at = cols_at + 24 * ncols * n;
++    memory::store_and_swap<uint32_t>(v + 8, n);
++    memory::store_and_swap<uint32_t>(v + 12, n ? base + rows_at : 0);
++    for (uint32_t r = 0; r < n; ++r) {
++      const StatsRow& src = found->rows[r];
++      uint8_t* row = data + rows_at + r * 48;
++      memory::store_and_swap<uint64_t>(row + 0, src.xuid);
++      memory::store_and_swap<uint32_t>(row + 8, src.rank);
++      memory::store_and_swap<uint64_t>(row + 16, uint64_t(src.rating));
++      std::memcpy(row + 24, src.name.data(), std::min<size_t>(src.name.size(), 15));
++      memory::store_and_swap<uint32_t>(row + 40, ncols);
++      memory::store_and_swap<uint32_t>(row + 44, ncols ? base + cols_at : 0);
++      for (uint32_t c = 0; c < ncols; ++c) {
++        uint8_t* col = data + cols_at + c * 24;
++        const uint16_t id = spec.columns[c];
++        memory::store_and_swap<uint16_t>(col + 0, id);
++        if (id == kColGamertag) {
++          const std::string& nm = src.name;
++          const uint32_t chars = uint32_t(std::min<size_t>(nm.size(), 15));
++          for (uint32_t k = 0; k < chars; ++k)
++            memory::store_and_swap<uint16_t>(data + text_at + k * 2, uint16_t(uint8_t(nm[k])));
++          col[8] = kDataUnicode;
++          memory::store_and_swap<uint32_t>(col + 16, (chars + 1) * 2);
++          memory::store_and_swap<uint32_t>(col + 20, base + text_at);
++          continue;
++        }
++        int64_t value = 0;
++        uint8_t type = kDataInt32;
++        if (id == kColRank) {
++          value = src.rank;
++        } else if (id == kColRating) {
++          value = src.rating;
++          type = kDataInt64;
++        }
++        auto it = src.columns.find(id);
++        if (it != src.columns.end()) {
++          value = it->second.first;
++          type = it->second.second;
++        }
++        col[8] = type;
++        if (type == kDataInt64) memory::store_and_swap<uint64_t>(col + 16, uint64_t(value));
++        else memory::store_and_swap<uint32_t>(col + 16, uint32_t(int32_t(value)));
++      }
++      cols_at += 24 * ncols;
++      if (has_name) text_at += 32;
++    }
++    free_at = text_at;
++  }
++}
++
++std::string DescribeAnswer(const std::vector<StatsView>& answer) {
++  std::string s;
++  for (const auto& v : answer) s += fmt::format(" [view {} {} of {}]", v.view, v.rows.size(), v.total);
++  return s.empty() ? std::string(" (nothing)") : s;
++}
++
 +class XStatsEnumerator : public XEnumerator {
 + public:
-+  XStatsEnumerator(KernelState* ks, std::vector<uint32_t> views)
-+      : XEnumerator(ks, 1, 0), views_(std::move(views)) {}
-+  static uint32_t SizeFor(size_t views) { return uint32_t(8 + 16 * views); }
++  XStatsEnumerator(KernelState* ks, std::vector<StatsSpec> specs, std::string request, uint32_t rows)
++      : XEnumerator(ks, 1, 0), specs_(std::move(specs)), request_(std::move(request)), rows_(rows) {}
++  uint32_t size() const { return StatsBufferSize(specs_, rows_); }
 +  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override {
 +    if (done_) return X_ERROR_NO_MORE_FILES;
 +    done_ = true;
-+    std::memset(buffer_data, 0, SizeFor(views_.size()));
-+    memory::store_and_swap<uint32_t>(buffer_data + 0, uint32_t(views_.size()));
-+    memory::store_and_swap<uint32_t>(buffer_data + 4, buffer_ptr + 8);
-+    for (size_t i = 0; i < views_.size(); ++i) {
-+      uint8_t* v = buffer_data + 8 + i * 16;
-+      memory::store_and_swap<uint32_t>(v + 0, views_[i]);
-+      // total rows 0, rows 0, rows pointer 0
-+    }
++    const auto answer = QueryStats(request_);
++    FillStats(buffer_ptr, buffer_data, size(), specs_, answer, rows_);
++    REXLOG_INFO("LIVE leaderboards '{}':{}", request_, DescribeAnswer(answer));
 +    if (written_count) *written_count = 1;
 +    return X_ERROR_SUCCESS;
 +  }
 +
 + private:
-+  std::vector<uint32_t> views_;
++  std::vector<StatsSpec> specs_;
++  std::string request_;
++  uint32_t rows_;
 +  bool done_ = false;
 +};
++
++}  // namespace
++
++// XUserReadStats (xgi_app.cpp 0xB0021): rows of these players (friends board,
++// the player's own stats). The title library checked results_size already.
++uint32_t LiveStatsRead(uint32_t num_xuids, uint32_t xuids_ptr, uint32_t num_specs, uint32_t specs_ptr,
++                       uint32_t results_size, uint32_t results_ptr) {
++  if (!results_ptr || !specs_ptr || !num_specs || num_specs > 64) return X_E_INVALIDARG;
++  auto* mem = REX_KERNEL_MEMORY();
++  const auto specs = CopySpecs(num_specs, mem->TranslateVirtual<X_USER_STATS_SPEC*>(specs_ptr));
++  std::string request = "list " + SpecViews(specs, ',');
++  const uint32_t nx = std::min<uint32_t>(num_xuids, 100);
++  for (uint32_t i = 0; i < nx && xuids_ptr; ++i)
++    request += fmt::format(" {:016x}", memory::load_and_swap<uint64_t>(mem->TranslateVirtual(xuids_ptr + i * 8)));
++  const auto answer = QueryStats(request);
++  FillStats(results_ptr, mem->TranslateVirtual<uint8_t*>(results_ptr), results_size, specs, answer, nx);
++  static std::atomic<int> told{0};
++  if (told++ < 40) REXLOG_INFO("LIVE XUserReadStats '{}':{}", request, DescribeAnswer(answer));
++  return X_E_SUCCESS;
++}
++
++// XSessionWriteStats (xgi_app.cpp 0xB0025): one player's results for some
++// views. session_flags / others / ranked: the session it was written in.
++// At match end the game writes one row per player back to back (all on the
++// same tick), and by then the session's remote count and the game's player
++// list are often already gone (others came out 0 in a 2-player Ranked match,
++// so the server refused it). So the rows of one session are collected for
++// ~1.5 s and posted together; others = at least (distinct XUIDs - 1).
++namespace {
++struct PendingStats {
++  uint32_t flags = 0;
++  int others = 0;
++  bool ranked = false;
++  std::vector<uint64_t> xuids;
++  std::string lines;
++};
++std::mutex g_pending_stats_mutex;
++std::map<uint32_t, PendingStats> g_pending_stats;
++}  // namespace
++
++void LiveStatsWrite(uint32_t session_obj, uint64_t xuid, uint32_t num_views, uint32_t views_ptr,
++                    uint32_t session_flags, int others, bool ranked) {
++  if (!REXCVAR_GET(xam_signed_in_to_live) || !views_ptr || !num_views) return;
++  auto* mem = REX_KERNEL_MEMORY();
++  std::string lines;
++  for (uint32_t i = 0; i < std::min<uint32_t>(num_views, 64); ++i) {
++    const uint8_t* v = mem->TranslateVirtual<uint8_t*>(views_ptr + i * 12);
++    const uint32_t view = memory::load_and_swap<uint32_t>(v + 0);
++    const uint32_t nprops = std::min<uint32_t>(memory::load_and_swap<uint32_t>(v + 4), 64);
++    const uint32_t props_ptr = memory::load_and_swap<uint32_t>(v + 8);
++    if (!props_ptr || !nprops) continue;
++    std::string line = fmt::format("W {:016x} {}", xuid, view);
++    for (uint32_t k = 0; k < nprops; ++k) {
++      const uint8_t* p = mem->TranslateVirtual<uint8_t*>(props_ptr + k * 24);
++      const uint32_t id = memory::load_and_swap<uint32_t>(p + 0);
++      const uint8_t type = p[8];
++      int64_t value = 0;
++      if (type == kDataInt32) value = int32_t(memory::load_and_swap<uint32_t>(p + 16));
++      else if (type == kDataInt64) value = int64_t(memory::load_and_swap<uint64_t>(p + 16));
++      else if (type == 3) {  // double
++        const uint64_t bits = memory::load_and_swap<uint64_t>(p + 16);
++        double d;
++        std::memcpy(&d, &bits, 8);
++        value = int64_t(d);
++      } else if (type == 5) {  // float
++        const uint32_t bits = memory::load_and_swap<uint32_t>(p + 16);
++        float f;
++        std::memcpy(&f, &bits, 4);
++        value = int64_t(f);
++      } else {
++        continue;
++      }
++      line += fmt::format(" {:x}={}", id, value);
++    }
++    lines += line + "\n";
++  }
++  static std::atomic<int> told{0};
++  if (told++ < 200)
++    REXLOG_INFO("LIVE XSessionWriteStats(session {:08X}, xuid {:016X}, {} views): {}", session_obj, xuid, num_views,
++                lines.empty() ? std::string("(no rows)") : lines.substr(0, 400));
++  if (lines.empty()) return;
++  bool first = false;
++  {
++    std::lock_guard<std::mutex> l(g_pending_stats_mutex);
++    auto it = g_pending_stats.find(session_obj);
++    first = it == g_pending_stats.end();
++    auto& b = g_pending_stats[session_obj];
++    b.flags = session_flags ? session_flags : b.flags;
++    b.others = std::max(b.others, others);
++    b.ranked = b.ranked || ranked;
++    if (std::find(b.xuids.begin(), b.xuids.end(), xuid) == b.xuids.end()) b.xuids.push_back(xuid);
++    b.lines += lines;
++  }
++  if (!first) return;
++  std::thread([session_obj]() {
++    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
++    PendingStats b;
++    {
++      std::lock_guard<std::mutex> l(g_pending_stats_mutex);
++      auto it = g_pending_stats.find(session_obj);
++      if (it == g_pending_stats.end()) return;
++      b = std::move(it->second);
++      g_pending_stats.erase(it);
++    }
++    const int others = std::max(b.others, int(b.xuids.size()) - 1);
++    std::string body = fmt::format("S {:x} {} {} {}\n", b.flags, others, b.ranked ? 1 : 0,
++                                   rex::system::online::Modded() ? 1 : 0) + b.lines;
++    REXLOG_INFO("Leaderboards: posting {} player(s), others {}, ranked {}", b.xuids.size(), others, b.ranked ? 1 : 0);
++    rex::system::online::LiveStatsPostAsync("/lb/write", MyName(), std::move(body));
++  }).detach();
++}
 +
 +u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 type, u64 pivot, u32 num_rows,
 +                                       u32 num_specs, ppc_ptr_t<X_USER_STATS_SPEC> specs,
 +                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
 +  if (!num_specs || num_specs > 64 || !specs || !handle_ptr) return X_ERROR_INVALID_PARAMETER;
-+  std::vector<uint32_t> views;
++  auto copied = CopySpecs(num_specs, &specs[0]);
++  const uint32_t rows = std::clamp<uint32_t>(num_rows, 1, 100);
++  uint64_t pivot64 = uint64_t(pivot);
++  // Export arguments arrive as 32 bits (ArgTranslator reads rN.u32), so an
++  // XUID pivot loses its upper half: the game asks around its own player, so
++  // put this player's multiplayer XUID back (the server also matches the low
++  // 32 bits when nothing else fits).
++  if (!type && !(pivot64 >> 32)) {
++    const uint64_t mine = rex::system::online::OnlineXuid();
++    const auto& profile = REX_KERNEL_STATE()->user_profile();
++    if (uint32_t(mine) == uint32_t(pivot64) || (profile && uint32_t(profile->xuid()) == uint32_t(pivot64)))
++      pivot64 = mine;
++  }
++  std::string request = type ? fmt::format("rank {} {} ", pivot64 ? pivot64 : 1, rows)
++                             : fmt::format("xuid {:016x} {} ", pivot64, rows);
++  request += SpecViews(copied, ' ');
 +  std::string desc;
-+  for (uint32_t i = 0; i < num_specs; ++i) {
-+    const auto& spec = specs[i];
-+    views.push_back(spec.view_id);
-+    desc += fmt::format(" [view {} cols", uint32_t(spec.view_id));
-+    for (uint32_t c = 0; c < std::min<uint32_t>(spec.num_column_ids, 64); ++c)
-+      desc += fmt::format(" {}", uint16_t(spec.column_ids[c]));
++  for (const auto& s : copied) {
++    desc += fmt::format(" [view {} cols", s.view);
++    for (uint16_t c : s.columns) desc += fmt::format(" {:X}", c);
 +    desc += "]";
 +  }
 +  REXLOG_INFO("LIVE XUserCreateStatsEnumerator(title {:08X}, {} {:X}, {} rows):{}", uint32_t(title_id),
 +              type ? "rank" : "xuid", uint64_t(pivot), uint32_t(num_rows), desc);
-+  if (buffer_size_ptr) *buffer_size_ptr = XStatsEnumerator::SizeFor(views.size());
-+  auto e = object_ref<XStatsEnumerator>(new XStatsEnumerator(REX_KERNEL_STATE(), std::move(views)));
++  auto e = object_ref<XStatsEnumerator>(new XStatsEnumerator(REX_KERNEL_STATE(), std::move(copied), request, rows));
++  if (buffer_size_ptr) *buffer_size_ptr = e->size();
 +  auto result = e->Initialize(0xFF, 0xFB, 0xB0021, 0xB0022, 0);
 +  if (XFAILED(result)) return result;
 +  *handle_ptr = e->handle();
@@ -12215,7 +12653,7 @@ index 8778066..62a577c 100644
  u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 xuid, u32 flags,
                                               u32 offset, u32 count, mapped_u32 buffer_size_ptr,
                                               mapped_u32 handle_ptr) {
-@@ -761,7 +853,7 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
+@@ -761,7 +1193,7 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
  REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
  REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
  REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
@@ -14616,11 +15054,11 @@ index bd43109..7c34df1 100644
  
  PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
 diff --git a/src/system/online_identity.cpp b/src/system/online_identity.cpp
-new file mode 100644
-index 0000000..1990170
+new file mode 100755
+index 0000000..3756634
 --- /dev/null
 +++ b/src/system/online_identity.cpp
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,430 @@
 +/**
 + * Saints Reborn online identity and fair play (used by eos_lan.cpp, the
 + * Xbox Live session layer and the user profile).
@@ -14655,6 +15093,13 @@ index 0000000..1990170
 +#include <windows.h>
 +#include <bcrypt.h>
 +#pragma comment(lib, "bcrypt.lib")
++#include <winhttp.h>
++#pragma comment(lib, "winhttp.lib")
++
++#include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <thread>
 +
 +#include "sr_reserved_names.h"
 +
@@ -14882,6 +15327,165 @@ index 0000000..1990170
 +    REXSYS_INFO("Online: multiplayer XUID {:016X} (profile XUID unchanged)", xuid);
 +  });
 +  return xuid;
++}
++
++
++// ------------------------------------------------------------ stats server --
++// Leaderboards (xam_user.cpp LiveStats*, server/gangs/leaderboards.js): plain
++// text POSTs to the Saints Reborn server the gangs bridge uses (gangs_server.txt
++// next to the exe, default below; "off" = no leaderboards), as the gang account:
++// this player's multiplayer XUID + the per-install key in gangs_key.txt (made
++// here when the gangs bridge has not made it yet; same format and place).
++namespace {
++constexpr const char* kStatsServer = "https://saints-reborn-gangs.saintsreborn.workers.dev";
++
++std::string ReadSmallFile(const char* name) {
++  std::string s;
++  if (FILE* f = std::fopen(name, "rb")) {
++    char buf[1024];
++    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
++    std::fclose(f);
++    s.assign(buf, n);
++  }
++  while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) s.pop_back();
++  while (!s.empty() && (s.front() == ' ' || s.front() == '\xEF' || s.front() == '\xBB' || s.front() == '\xBF')) s.erase(0, 1);
++  return s;
++}
++
++const std::string& StatsServer() {
++  static const std::string url = [] {
++    std::string u = ReadSmallFile("gangs_server.txt");
++    if (u.empty()) u = kStatsServer;
++    if (u == "off") u.clear();
++    while (!u.empty() && u.back() == '/') u.pop_back();
++    REXSYS_INFO("Leaderboards: server {}", u.empty() ? "off (gangs_server.txt)" : u);
++    return u;
++  }();
++  return url;
++}
++
++const std::string& StatsKey() {
++  static const std::string key = [] {
++    std::string k = ReadSmallFile("gangs_key.txt");
++    if (k.size() >= 32) return k;
++    uint8_t rnd[20] = {};
++    if (BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
++      const uint64_t t = GetTickCount64() ^ (uint64_t(GetCurrentProcessId()) << 32);
++      std::memcpy(rnd, &t, 8);
++    }
++    k = Hex(rnd, sizeof(rnd));  // 40 hex digits, like the gangs bridge
++    if (FILE* f = std::fopen("gangs_key.txt", "wb")) {
++      std::fwrite(k.data(), 1, k.size(), f);
++      std::fclose(f);
++    }
++    return k;
++  }();
++  return key;
++}
++
++struct StatsJob {
++  std::string path, name, body;
++};
++std::mutex g_stats_mutex;
++std::condition_variable g_stats_cv;
++std::deque<StatsJob> g_stats_jobs;
++std::atomic<bool> g_stats_worker{false};
++}  // namespace
++
++}  // namespace rex::system::online
++
++extern "C" int SrMyPuid(char* out, int size);  // eos_lan.cpp / eos_lan_off.cpp
++
++namespace rex::system::online {
++
++// POST body to <server><path>; false when the server could not be reached or
++// did not answer 200.
++bool LiveStatsPost(const std::string& path, const std::string& name, const std::string& body, std::string& reply,
++                   int timeout_ms) {
++  reply.clear();
++  const std::string& server = StatsServer();
++  if (server.empty()) return false;
++  const std::wstring wurl(server.begin(), server.end());
++  URL_COMPONENTS uc{};
++  uc.dwStructSize = sizeof(uc);
++  wchar_t host[256] = {}, base[1024] = {};
++  uc.lpszHostName = host;
++  uc.dwHostNameLength = 255;
++  uc.lpszUrlPath = base;
++  uc.dwUrlPathLength = 1023;
++  if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return false;
++  static HINTERNET session = WinHttpOpen(L"SaintsReborn-Stats/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
++                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
++  if (!session) return false;
++  HINTERNET c = WinHttpConnect(session, host, uc.nPort, 0);
++  if (!c) return false;
++  std::wstring p = base;
++  p += std::wstring(path.begin(), path.end());
++  HINTERNET r = WinHttpOpenRequest(c, L"POST", p.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
++                                   uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
++  bool ok = false;
++  if (r) {
++    WinHttpSetTimeouts(r, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
++    char xuid[32];
++    std::snprintf(xuid, sizeof(xuid), "%016llx", static_cast<unsigned long long>(OnlineXuid()));
++    std::string h = "Content-Type: text/plain\r\nX-SR-Xuid: " + std::string(xuid) + "\r\nX-SR-Key: " + StatsKey() +
++                    "\r\nX-SR-Name: " + SafeName(name) + "\r\nX-SR-Version: 1\r\n";
++    char puid[128] = {};
++    if (SrMyPuid(puid, sizeof(puid)) > 0) h += std::string("X-SR-Puid: ") + puid + "\r\n";
++    const std::wstring wh(h.begin(), h.end());
++    if (WinHttpSendRequest(r, wh.c_str(), DWORD(-1), body.empty() ? nullptr : const_cast<char*>(body.data()),
++                           DWORD(body.size()), DWORD(body.size()), 0) &&
++        WinHttpReceiveResponse(r, nullptr)) {
++      DWORD code = 0, len = sizeof(code);
++      WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &code, &len, nullptr);
++      for (;;) {
++        DWORD avail = 0;
++        if (!WinHttpQueryDataAvailable(r, &avail) || avail == 0) break;
++        const size_t at = reply.size();
++        if (at + avail > (1u << 20)) break;
++        reply.resize(at + avail);
++        DWORD got = 0;
++        if (!WinHttpReadData(r, reply.data() + at, avail, &got)) break;
++        reply.resize(at + got);
++      }
++      ok = code == 200;
++      if (!ok) REXSYS_WARN("Leaderboards: {} answered {} ({})", path, code, reply.substr(0, 80));
++    }
++    WinHttpCloseHandle(r);
++  }
++  WinHttpCloseHandle(c);
++  return ok;
++}
++
++// Same, on a background thread, in order (match results: the game must not wait).
++void LiveStatsPostAsync(const std::string& path, const std::string& name, std::string body) {
++  if (StatsServer().empty()) return;
++  {
++    std::lock_guard<std::mutex> l(g_stats_mutex);
++    if (g_stats_jobs.size() >= 256) g_stats_jobs.pop_front();
++    g_stats_jobs.push_back({path, name, std::move(body)});
++  }
++  g_stats_cv.notify_one();
++  if (g_stats_worker.exchange(true)) return;
++  std::thread([] {
++    for (;;) {
++      StatsJob job;
++      {
++        std::unique_lock<std::mutex> l(g_stats_mutex);
++        g_stats_cv.wait(l, [] { return !g_stats_jobs.empty(); });
++        job = std::move(g_stats_jobs.front());
++        g_stats_jobs.pop_front();
++      }
++      std::string reply;
++      bool ok = false;
++      for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
++        if (attempt) std::this_thread::sleep_for(std::chrono::seconds(5 * attempt));
++        ok = LiveStatsPost(job.path, job.name, job.body, reply, 10000);
++      }
++      if (ok) REXSYS_INFO("Leaderboards: {} -> {}", job.path, reply.substr(0, reply.find('\n')));
++      else REXSYS_WARN("Leaderboards: {} failed (server unreachable), {} bytes dropped", job.path, job.body.size());
++    }
++  }).detach();
 +}
 +
 +}  // namespace rex::system::online
