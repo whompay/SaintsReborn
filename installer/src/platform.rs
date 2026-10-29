@@ -256,45 +256,39 @@ pub fn create_shortcuts(r: &Reporter, dir: &Path, desktop: bool, setup_copy: Opt
     }
     #[cfg(not(windows))]
     {
-        let _ = desktop;
-        let runner = ["umu-run", "wine"].into_iter().find(|t| which(t).is_some());
-        let apps = home().join(".local/share/applications");
-        let exec = match runner {
-            Some(t) => format!(
-                "sh -c 'cd \"{}\" && {} \"{}\"'",
-                dist.display(),
-                t,
-                target.display()
-            ),
-            None => {
-                r.log(
-                    "Neither umu-run nor wine was found, so no menu entry was made. In Steam: Add a Game > \
-                     Add a Non-Steam Game > choose dist/WhompaysModLoader.exe, then Properties > Compatibility > \
-                     Force Proton.",
-                );
-                return;
-            }
-        };
-        let mut text = format!(
-            "[Desktop Entry]\nType=Application\nName=Saints Reborn\nComment=Play Saints Reborn\nExec={exec}\n\
-             Path={}\nCategories=Game;\nTerminal=false\n",
-            dist.display()
-        );
-        let icon = dir.join("project/res/SaintsReborn.png");
-        if icon.exists() {
-            text += &format!("Icon={}\n", icon.display());
-        }
+        let apps = data_dir().parent().unwrap_or(&home()).join("applications");
         let _ = fs::create_dir_all(&apps);
-        if fs::write(apps.join("saintsreborn.desktop"), text).is_err() {
-            r.log("Could not create the application menu entry (the game itself is fine).");
+        let quote = |p: &Path| desktop_arg(&p.to_string_lossy());
+        if let Some(t) = ["umu-run", "wine"].into_iter().find(|t| which(t).is_some()) {
+            let text = format!(
+                "[Desktop Entry]\nType=Application\nName=Saints Reborn\nExec={} {}\nPath={}\nCategories=Game;\nTerminal=false\n",
+                desktop_arg(t),
+                quote(&target),
+                desktop_value(&dist.to_string_lossy())
+            );
+            if fs::write(apps.join("saintsreborn.desktop"), &text).is_err() {
+                r.log("Could not create the game application entry.");
+            }
+            if desktop {
+                let path = capture(std::process::Command::new("xdg-user-dir").arg("DESKTOP"))
+                    .map(|s| PathBuf::from(s.trim()))
+                    .filter(|p| p.is_absolute())
+                    .unwrap_or_else(|| home().join("Desktop"));
+                let _ = fs::write(path.join("saintsreborn.desktop"), &text);
+            }
+        } else {
+            r.log("Install umu-launcher or add dist/WhompaysModLoader.exe to Steam and enable Proton.");
         }
         if let Some(setup) = setup_copy {
-            let t = format!(
-                "[Desktop Entry]\nType=Application\nName=Update Saints Reborn\nExec=\"{}\" --update\nPath={}\nCategories=Game;\nTerminal=false\n",
-                setup.display(),
-                dir.display()
+            let text = format!(
+                "[Desktop Entry]\nType=Application\nName=Update Saints Reborn\nExec={} --update --dir {}\nPath={}\nCategories=Game;\nTerminal=false\n",
+                quote(setup),
+                quote(dir),
+                desktop_value(&dir.to_string_lossy())
             );
-            let _ = fs::write(apps.join("saintsreborn-update.desktop"), t);
+            if fs::write(apps.join("saintsreborn-update.desktop"), text).is_err() {
+                r.log("Could not create the update application entry.");
+            }
         }
     }
 }
@@ -390,4 +384,29 @@ pub fn launch_game(dir: &Path) -> Result<()> {
             .spawn()?;
     }
     Ok(())
+}
+
+/// Escape the Desktop Entry string layer, independently of Exec quoting.
+#[cfg(not(windows))]
+fn desktop_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+#[cfg(not(windows))]
+fn desktop_arg(s: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in s.chars() {
+        if matches!(c, '\\' | '"' | '`' | '$') {
+            quoted.push('\\');
+        }
+        if c == '%' {
+            quoted.push('%');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    desktop_value(&quoted)
 }

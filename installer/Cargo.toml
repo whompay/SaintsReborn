@@ -11,10 +11,14 @@ publish = false
 name = "SaintsReborn-Setup"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd"]
+
 [dependencies]
 anyhow = "1"
-eframe = "0.34.2"
-rfd = "0.17.2"
+eframe = { version = "0.34.2", optional = true }
+rfd = { version = "0.17.2", optional = true }
 ureq = "2.12"
 sha1 = "0.10"
 sha2 = "0.10"

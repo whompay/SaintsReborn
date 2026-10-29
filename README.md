@@ -58,8 +58,9 @@ list. They are always on.
 
 ### Linux (Steam Deck, desktop Linux)
 
-Coming soon: Setup will build the game on Linux, and you'll play it with
-Proton.
+Download **Saints-Reborn-Linux-Setup.run** from the Releases page, make it
+executable and open it. It builds the game on your PC without sudo and plays it with
+Proton (through Steam on SteamOS / Steam Deck). See [linux/README.md](linux/README.md).
 
 ## Requirements (manual build with setup.bat)
 

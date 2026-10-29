@@ -293,17 +293,23 @@ fn write_case_overlay(winsysroot: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+// LLVM config files have their own quoting rules, separate from shell argv.
+fn clang_config_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn write_clang_config(llvm_bin: &Path, winsysroot: &Path) -> Result<()> {
-    let root = winsysroot.to_string_lossy().replace('\\', "/");
+    let root = clang_config_quote(&winsysroot.to_string_lossy().replace('\\', "/"));
     #[cfg_attr(windows, allow(unused_mut))]
     let mut cfg = format!(
-        "-Xmicrosoft-windows-sys-root \"{root}\"\n-fuse-ld=lld\n-Wno-unused-command-line-argument\n"
+        "-Xmicrosoft-windows-sys-root {root}\n-fuse-ld=lld\n-Wno-unused-command-line-argument\n"
     );
     #[cfg(not(windows))]
     {
         let overlay = write_case_overlay(winsysroot)?;
-        let o = overlay.to_string_lossy();
-        cfg += &format!("-ivfsoverlay \"{o}\"\n-Xlinker \"/vfsoverlay:{o}\"\n");
+        let o = clang_config_quote(&overlay.to_string_lossy());
+        let link_overlay = clang_config_quote(&format!("/vfsoverlay:{}", overlay.display()));
+        cfg += &format!("-ivfsoverlay {o}\n-Xlinker {link_overlay}\n");
     }
     let mut names = vec![
         "x86_64-pc-windows-msvc.cfg",
@@ -321,7 +327,10 @@ fn write_clang_config(llvm_bin: &Path, winsysroot: &Path) -> Result<()> {
 
 #[cfg(not(windows))]
 fn write_cross_file(llvm_bin: &Path) -> Result<PathBuf> {
-    let b = llvm_bin.to_string_lossy();
+    let b = llvm_bin
+        .to_string_lossy()
+        .replace('"', "\\\"")
+        .replace('$', "\\$");
     let text = format!(
         "# Builds Windows x64 programs with clang + lld + the xwin headers/libraries.\n\
          set(CMAKE_SYSTEM_NAME Windows)\n\
@@ -396,6 +405,21 @@ pub fn ensure_all(r: &Reporter, accept_license: bool, install_dir: &Path) -> Res
             "The downloaded clang does not run ({}).",
             tc.clang().display()
         );
+    }
+    #[cfg(not(windows))]
+    {
+        r.status("Checking the LLVM linker runtime");
+        let linker = tc.llvm_bin.join("lld-link");
+        let version = report::capture(tc.env.command(&linker).arg("--version"));
+        if version
+            .as_deref()
+            .is_none_or(|v| !v.contains(config::LLVM_VERSION))
+        {
+            bail!(
+                "The LLVM linker cannot start ({}). Reopen the Linux Setup launcher to install its private runtime libraries, including libxml2.so.2.",
+                linker.display()
+            );
+        }
     }
     // The old shared toolchain folder (%LOCALAPPDATA%\SaintsReborn\tools)
     // is no longer used: free its space.
