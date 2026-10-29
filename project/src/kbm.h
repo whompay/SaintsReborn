@@ -15,4 +15,8 @@ void AddMouseWheel(int delta);
 bool PlayerDriving(uint8_t* base);
 bool PauseMenuOpen();
 
+// Suspends the mouselook cursor capture (used while an interactive overlay
+// such as the display settings menu is open).
+void SetMouseCaptureSuspended(bool suspended);
+
 }  // namespace sr
