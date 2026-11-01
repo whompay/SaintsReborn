@@ -213,13 +213,20 @@ end
 
 -- ------------------------------------------------------------ taunts
 -- From the controller (any thread): new presses of D-pad down / left / right
--- while a set is chosen and you're playing; the game doesn't see them.
+-- while a set is chosen and you're playing on foot; the game doesn't see them.
 local T = { set = 0, prev = 0, pending = nil, pos = nil, playing = false, preview = nil, preview_at = nil }
 G.hook(G.INPUT_GET_STATE, function(ctx)
   local user, state = ctx:r(3) & MASK, ctx:r(5) & MASK
   ctx:call_original()
   if user ~= 0 or state == 0 or (ctx:r(3) & MASK) ~= 0 then return end
   if T.set == 0 or not T.playing then T.prev = 0; return end
+  -- Vehicles use these buttons for the radio. Check the current player here
+  -- because input can be polled between the character update ticks.
+  local p = G.player()
+  if p == 0 or G.vehicle_object(p) then
+    T.prev, T.pending = 0, nil
+    return
+  end
   local buttons = wml.read_u16(state + 4)
   local hide = buttons & 0xE
   for bit = 2, 8, 2 do
