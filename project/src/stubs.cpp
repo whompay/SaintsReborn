@@ -12,6 +12,7 @@
 #include "wml/mod_loader.h"
 #include "world_studio_bridge.h"
 
+#include <rex/cvar.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/ppc/function.h>
 #include <rex/runtime.h>
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -94,9 +96,35 @@ static void ForceFrameFlags(uint8_t* base, uint32_t dev) {
     PPC_STORE_U8(dev + 10809, PPC_LOAD_U8(dev + 10809) | 0x2);
 }
 
+// Customization can reuse garment data while the command processor still has
+// draws queued against it, briefly stretching shirts and trousers. Process
+// streams synchronously here, then restore the configured queue on exit.
+static void UpdateCustomizationQueue(uint8_t* base) {
+    const bool customizing = PPC_LOAD_U32(0x827B04D4u) == 1 ||
+                             PPC_LOAD_U32(0x839E0DF8u) == 0x82FFB7BCu ||
+                             PPC_LOAD_U32(0x839E0FB0u) == 0x82FFB7BCu;
+    static bool active = false;
+    static std::string saved_depth;
+    if (customizing && !active) {
+        saved_depth = rex::cvar::GetFlagByName("gpu_async_depth");
+        if (!saved_depth.empty() && rex::cvar::SetFlagByName("gpu_async_depth", "0")) {
+            active = true;
+            // Finish any streams submitted before the screen transition.
+            REX_KERNEL_STATE()->emulator()->graphics_system()->SubmitCommandStream(nullptr, 0);
+            REXLOG_INFO("Customization: synchronous command streams (saved queue depth {})", saved_depth);
+        }
+    } else if (!customizing && active) {
+        if (rex::cvar::SetFlagByName("gpu_async_depth", saved_depth)) {
+            active = false;
+            REXLOG_INFO("Customization: restored command queue depth {}", saved_depth);
+        }
+    }
+}
+
 // Present: force the frame flags on the device (r3) before the real call.
 extern "C" void __imp__sub_825E54A8(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_825E54A8) {
+    UpdateCustomizationQueue(base);
     const uint32_t dev = ctx.r3.u32;
     if (dev) {
         ForceFrameFlags(base, dev);
