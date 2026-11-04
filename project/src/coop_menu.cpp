@@ -54,7 +54,7 @@ constexpr uint32_t kMainMenuDone = 0x822861B8u;      // return address of sub_82
 constexpr uint32_t kPlayer = 0x8309ABECu;
 constexpr uint32_t kActiveScreen = 0x839E0DF8u;
 constexpr uint32_t kOtherActiveScreen = 0x839E0FB0u;
-constexpr uint32_t kPauseScreen = 0x82FFB84Cu;
+std::atomic<bool> g_pause_tabs_active{false};
 
 enum Action { kHost, kJoin, kStop, kName, kZombies };
 // 0-3: rows of the pause menu's CO-OP tab (mixed case like the game's own
@@ -669,13 +669,18 @@ extern "C" void __imp__sub_8228CBA0(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_8228CC90(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_82287FC0(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_822C06B8(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_822BFA88(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_822BFE38(PPCContext& ctx, uint8_t* base);
 
 namespace {
 bool CoopTabOn(uint8_t* base) { return Host(base, kMultiplayerFlag)[0] == 0 && CoopLoaded(); }
 
 bool CoopPauseScreenActive(uint8_t* base) {
-  return CoopTabOn(base) && (R32(base, kActiveScreen) == kPauseScreen ||
-                             R32(base, kOtherActiveScreen) == kPauseScreen);
+  // Active-screen pointers refer to reusable UI list nodes, not screen IDs.
+  // Recognize the pause session from its tab builder instead of a node's
+  // address, which changes after stores and other menus use the pool.
+  return CoopTabOn(base) && g_pause_tabs_active.load() && R32(base, kPlayer) != 0 &&
+         R32(base, 0x827B04D4u) == 0;
 }
 
 void RestoreEmptyCoopMenu(uint8_t* base) {
@@ -822,6 +827,21 @@ void UpdateCoopTab(PPCContext& ctx, uint8_t* base) {
 }
 }  // namespace
 
+// Keep pause ownership across tab transitions: the UI element list may be
+// empty while one tab is replaced by another. Only the native pause root's
+// entry and exit define the session lifetime.
+PPC_FUNC(sub_822BFA88) {
+  g_pause_tabs_active = true;
+  REXLOG_INFO("Co-op menu: pause root opened");
+  __imp__sub_822BFA88(ctx, base);
+}
+
+PPC_FUNC(sub_822BFE38) {
+  __imp__sub_822BFE38(ctx, base);
+  g_pause_tabs_active = false;
+  REXLOG_INFO("Co-op menu: pause root closed");
+}
+
 // Tab adder: after the story pause menu's OPTIONS tab, add CO-OP (menu id 46
 // with the OPTIONS functions, see above).
 PPC_FUNC(sub_822903E8) {
@@ -847,7 +867,8 @@ PPC_FUNC(sub_822B7328) {
   if (requested == kCoopId) {
     if (!CoopPauseScreenActive(base)) {
       RestoreEmptyCoopMenu(base);
-      REXLOG_INFO("Co-op menu: menu 46 outside the pause screen - left empty (store / wardrobe)");
+      REXLOG_INFO("Co-op menu: menu 46 outside the pause screen - left empty (store / wardrobe); session {}, player {:08X}, frontend {}",
+                  g_pause_tabs_active.load(), R32(base, kPlayer), R32(base, 0x827B04D4u));
       return;
     }
     BuildCoopTab(ctx, base);
