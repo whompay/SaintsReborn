@@ -2725,6 +2725,44 @@ SR_RT_TIMED(8214BE00, 8223E8D8)
 #undef SR_RT_TIMED
 
 extern "C" void __imp__sub_825D2478(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_825CDB08(PPCContext& ctx, uint8_t* base);
+namespace glass_alpha {
+// The glass effects blend their opacity and view-dependent reflection. The
+// inherited cutout alpha test (reference 160/255) rejects Gat's 0.5-opacity
+// lenses at some angles. Disable it only for a glass draw with a pixel shader,
+// then restore it before another material can draw. Keep the state cache intact.
+bool IsGlass(uint32_t hash) {
+    return hash == 0xF04DA63F || hash == 0xFCAE7DF7 ||
+           hash == 0xE1196D93 || hash == 0xEDFAB65B;
+}
+class DrawScope {
+    PPCContext& ctx_;
+    uint8_t* base_;
+    uint32_t device_ = 0;
+    void Set(bool enabled) {
+        PPCContext scratch = ctx_;
+        scratch.r3.u64 = device_;
+        scratch.r4.u64 = enabled ? 1 : 0;
+        __imp__sub_825CDB08(scratch, base_);
+    }
+public:
+    DrawScope(PPCContext& ctx, uint8_t* base) : ctx_(ctx), base_(base) {
+        const uint32_t device = ctx.r3.u32;
+        if (!(Rd32(base, device + 10428) & 8) || !Rd32(base, device + 12200)) return;
+        const uint32_t tls = Rd32(base, ctx.r13.u32);
+        const uint32_t state = Rd32(base, tls + 7692);
+        const uint32_t shader = Rd32(base, state + 4252);
+        if (shader == 0xFFFFFFFFu) return;
+        const uint32_t shaders = Rd32(base, state + 4280);
+        if (!shaders || !IsGlass(Rd32(base, shaders + shader * 12))) return;
+        device_ = device;
+        Set(false);
+    }
+    ~DrawScope() { if (device_) Set(true); }
+    DrawScope(const DrawScope&) = delete;
+    DrawScope& operator=(const DrawScope&) = delete;
+};
+}  // namespace glass_alpha
 static void sr_draw_body(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_825D2478) {
     if (native_mesh::RecActive(ctx)) [[unlikely]] {
@@ -2733,6 +2771,7 @@ PPC_FUNC(sub_825D2478) {
         native_mesh::RecAfter(ctx, base);
         return;
     }
+    glass_alpha::DrawScope glass(ctx, base);
     sr_draw_body(ctx, base);
 }
 static void sr_draw_body(PPCContext& ctx, uint8_t* base) {
