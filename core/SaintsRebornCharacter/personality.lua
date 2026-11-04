@@ -230,7 +230,7 @@ G.hook(G.INPUT_GET_STATE, function(ctx)
   -- because input can be polled between the character update ticks.
   local p = G.player()
   if p == 0 or G.vehicle_object(p) then
-    T.prev, T.pending = 0, nil
+    T.prev, T.pending = buttons, nil
     return
   end
   local hide = buttons & 0xE
