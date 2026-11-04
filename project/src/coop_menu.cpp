@@ -53,6 +53,8 @@ constexpr uint32_t kPauseOptionsDone = 0x822B7C04u;  // return address of sub_82
 constexpr uint32_t kMainMenuDone = 0x822861B8u;      // return address of sub_8228CAD8 in sub_822852B0
 constexpr uint32_t kPlayer = 0x8309ABECu;
 constexpr uint32_t kActiveScreen = 0x839E0DF8u;
+constexpr uint32_t kOtherActiveScreen = 0x839E0FB0u;
+std::atomic<bool> g_pause_tabs_active{false};
 
 enum Action { kHost, kJoin, kStop, kName, kZombies };
 // 0-3: rows of the pause menu's CO-OP tab (mixed case like the game's own
@@ -65,7 +67,7 @@ constexpr int kTabLabel = 4, kMainLabel = 5;
 // with sub_822903E8(r3 = name, r4 = selected, r5 = menu id): MAP 26, INFO 32,
 // HELP 42, PHONE 29, MP3 27, SAVE/LOAD 44, OPTIONS 43. A menu id indexes the
 // table at 0x827B05F8 (16 bytes: build, exit, update, draw); ids 46 and 47
-// are unused (no-op functions). The menu manager at 0x8370DDAC (+0 current id,
+// are empty placeholders also used by stores and wardrobes. The menu manager at 0x8370DDAC (+0 current id,
 // +4 requested id) calls exit of the current menu and build of the
 // requested one, then update of the current one every frame; the tabs'
 // LT/RT switching (sub_822C06B8, called by each tab's update) requests ids.
@@ -74,6 +76,7 @@ constexpr int kTabLabel = 4, kMainLabel = 5;
 constexpr uint32_t kMenuCurrent = 0x8370DDACu, kMenuRequested = 0x8370DDB0u;
 constexpr uint32_t kMenuTable = 0x827B05F8u;
 constexpr uint32_t kOptionsId = 43, kCoopId = 46;
+constexpr uint32_t kEmptyMenuFunc = 0x826BA8E0u;
 // Main menu > SYSTEM LINK (id 19, sub_82331070: tabs 20 SYSTEM LINK, 21
 // OPTIONS, 30 HELP) and XBOX LIVE (id 6, sub_82330E48: its own tabs plus the
 // same 21 OPTIONS and 30 HELP). The OPTIONS tab (id 21, build sub_823487B8,
@@ -666,9 +669,29 @@ extern "C" void __imp__sub_8228CBA0(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_8228CC90(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_82287FC0(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_822C06B8(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_822BFA88(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_822BFE38(PPCContext& ctx, uint8_t* base);
 
 namespace {
 bool CoopTabOn(uint8_t* base) { return Host(base, kMultiplayerFlag)[0] == 0 && CoopLoaded(); }
+
+bool CoopPauseScreenActive(uint8_t* base) {
+  // Active-screen pointers refer to reusable UI list nodes, not screen IDs.
+  // Recognize the pause session from its tab builder instead of a node's
+  // address, which changes after stores and other menus use the pool.
+  return CoopTabOn(base) && g_pause_tabs_active.load() && R32(base, kPlayer) != 0 &&
+         R32(base, 0x827B04D4u) == 0;
+}
+
+void RestoreEmptyCoopMenu(uint8_t* base) {
+  std::lock_guard<std::recursive_mutex> lock(g_mutex);
+  // Clothing and tattoo screens request menu 46 as a blank placeholder.
+  // Restore every callback so OPTIONS cannot update or draw over their UI.
+  for (uint32_t i = 0; i < 4; ++i)
+    W32(base, kMenuTable + kCoopId * 16 + i * 4, kEmptyMenuFunc);
+  g_pause_first = -1;
+  g_pause_actions.clear();
+}
 
 void Call0(PPCContext& parent, uint8_t* base, void (*fn)(PPCContext&, uint8_t*)) {
   rex::CallFrame frame(parent);
@@ -804,6 +827,21 @@ void UpdateCoopTab(PPCContext& ctx, uint8_t* base) {
 }
 }  // namespace
 
+// Keep pause ownership across tab transitions: the UI element list may be
+// empty while one tab is replaced by another. Only the native pause root's
+// entry and exit define the session lifetime.
+PPC_FUNC(sub_822BFA88) {
+  g_pause_tabs_active = true;
+  REXLOG_INFO("Co-op menu: pause root opened");
+  __imp__sub_822BFA88(ctx, base);
+}
+
+PPC_FUNC(sub_822BFE38) {
+  __imp__sub_822BFE38(ctx, base);
+  g_pause_tabs_active = false;
+  REXLOG_INFO("Co-op menu: pause root closed");
+}
+
 // Tab adder: after the story pause menu's OPTIONS tab, add CO-OP (menu id 46
 // with the OPTIONS functions, see above).
 PPC_FUNC(sub_822903E8) {
@@ -826,7 +864,13 @@ PPC_FUNC(sub_822903E8) {
 // OPTIONS build, also used by the CO-OP tab.
 PPC_FUNC(sub_822B7328) {
   const uint32_t requested = R32(base, kMenuRequested);
-  if (requested == kCoopId && CoopLoaded()) {
+  if (requested == kCoopId) {
+    if (!CoopPauseScreenActive(base)) {
+      RestoreEmptyCoopMenu(base);
+      REXLOG_INFO("Co-op menu: menu 46 outside the pause screen - left empty (store / wardrobe); session {}, player {:08X}, frontend {}",
+                  g_pause_tabs_active.load(), R32(base, kPlayer), R32(base, 0x827B04D4u));
+      return;
+    }
     BuildCoopTab(ctx, base);
     return;
   }
@@ -836,7 +880,11 @@ PPC_FUNC(sub_822B7328) {
 // OPTIONS update, also used by the CO-OP tab.
 PPC_FUNC(sub_822B7D68) {
   const uint32_t current = R32(base, kMenuCurrent);
-  if (current == kCoopId && CoopLoaded()) {
+  if (current == kCoopId) {
+    if (!CoopPauseScreenActive(base)) {
+      RestoreEmptyCoopMenu(base);
+      return;
+    }
     UpdateCoopTab(ctx, base);
     return;
   }
