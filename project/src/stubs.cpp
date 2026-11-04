@@ -100,9 +100,8 @@ static void ForceFrameFlags(uint8_t* base, uint32_t dev) {
 // draws queued against it, briefly stretching shirts and trousers. Process
 // streams synchronously here, then restore the configured queue on exit.
 static void UpdateCustomizationQueue(uint8_t* base) {
-    const bool customizing = PPC_LOAD_U32(0x827B04D4u) == 1 ||
-                             PPC_LOAD_U32(0x839E0DF8u) == 0x82FFB7BCu ||
-                             PPC_LOAD_U32(0x839E0FB0u) == 0x82FFB7BCu;
+    // Mode 1 covers creator, clothing stores and wardrobes; UI nodes are reused.
+    const bool customizing = PPC_LOAD_U32(0x827B04D4u) == 1;
     static bool active = false;
     static std::string saved_depth;
     if (customizing && !active) {
