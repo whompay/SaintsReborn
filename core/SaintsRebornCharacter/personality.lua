@@ -219,7 +219,13 @@ G.hook(G.INPUT_GET_STATE, function(ctx)
   local user, state = ctx:r(3) & MASK, ctx:r(5) & MASK
   ctx:call_original()
   if user ~= 0 or state == 0 or (ctx:r(3) & MASK) ~= 0 then return end
-  if T.set == 0 or not T.playing then T.prev = 0; return end
+  local buttons = wml.read_u16(state + 4)
+  -- B (Q on keyboard) opens the weapon/food radial; its D-pad selects food.
+  -- Remember held directions so closing it cannot turn a food press into a taunt.
+  if (buttons & 0x2000) ~= 0 or T.set == 0 or not T.playing then
+    T.prev, T.pending = buttons, nil
+    return
+  end
   -- Vehicles use these buttons for the radio. Check the current player here
   -- because input can be polled between the character update ticks.
   local p = G.player()
@@ -227,7 +233,6 @@ G.hook(G.INPUT_GET_STATE, function(ctx)
     T.prev, T.pending = 0, nil
     return
   end
-  local buttons = wml.read_u16(state + 4)
   local hide = buttons & 0xE
   for bit = 2, 8, 2 do
     if bit ~= 6 and (buttons & bit) ~= 0 and (T.prev & bit) == 0 then T.pending = bit end
