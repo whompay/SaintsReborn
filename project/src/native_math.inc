@@ -1,60 +1,121 @@
 // NATIVE 4x4 MATRIX MULTIPLY (2026-10-01). 8219DFC0(r3 out, r4 A, r5 B): out = A * B, row-major,
 // 16 dot products (vmsum4fp128) on B transposed; ~2 % of all CPU (render thread + colour worker).
-// Same SSE ops in the same lanes as the recompiled code (dp_ps 0xFF, unpack transposes), same
-// flush-mode switch, same stack copies (r1-128 = B, r1-64 = A) and the same aligned-down stores.
+// Same results as the recompiled code's rex::ppc::simde_mm_vmsum4fp128, a row at a time instead of
+// 16 dots. Bit for bit except the payload or sign of a NaN from two or more NaN sources (NaN inputs,
+// inf * 0, inf - inf): the compiler may swap operands and x86 keeps the first NaN. Same flush-mode
+// switch, same stack copies (r1-128 = B, r1-64 = A) and the same aligned-down stores.
 // Needs a 16-byte aligned r1 (else the original runs). dist\native_math_off = original;
-// dist\native_math_verify = 1 call in 64: native into a temp, original for real, compare.
+// dist\native_math_verify = 1 call in 64: native into a temp, original for real, compare (two NaNs
+// count as equal). The first call runs SelfCheck; if it fails, the log has an error and the
+// original runs.
+#include <rex/ppc/intrinsics.h>
 extern "C" void __imp__sub_8219DFC0(PPCContext& ctx, uint8_t* base);
 namespace native_math {
 using u8 = uint8_t; using u32 = uint32_t;
 inline u8* G(u8* b, u32 a) { return b + a + REX_PHYS_HOST_OFFSET(a); }
-int Mode() {
-    static const int m = [] {
-        if (FILE* f = std::fopen("native_math_off", "rb")) { std::fclose(f); return 0; }
-        if (FILE* f = std::fopen("native_math_verify", "rb")) { std::fclose(f); return 2; }
-        return 1;
-    }();
-    return m;
+// A * B on host vectors (rows; host lane l holds guest element 3 - l) into out[4]. Row i of the
+// product is the sum over k of A[i][k] * (row k of B), and lane l of row k of B is B[k][3 - l], so
+// lane for lane this is what the original's 16 dots (A row i against B column 3 - l) produce. The
+// products are exact in double, so the sum order alone decides the bits: (w + y) + (z + x), as
+// simde_mm_vmsum4fp128 adds its host lanes (0 + 2) + (1 + 3).
+inline void MulRows(const __m128 a[4], const __m128 bm[4], __m128 out[4]) {
+    __m128d lo[4], hi[4];  // row k of B in double: host lanes 0-1 (B[k][3], B[k][2]) / 2-3 (B[k][1], B[k][0])
+    for (int k = 0; k < 4; ++k) {
+        lo[k] = _mm_cvtps_pd(bm[k]);
+        hi[k] = _mm_cvtps_pd(_mm_movehl_ps(bm[k], bm[k]));
+    }
+    for (int i = 0; i < 4; ++i) {
+        const __m128d a_wz = _mm_cvtps_pd(a[i]), a_yx = _mm_cvtps_pd(_mm_movehl_ps(a[i], a[i]));
+        const __m128d w = _mm_unpacklo_pd(a_wz, a_wz), z = _mm_unpackhi_pd(a_wz, a_wz);  // A[i][3], A[i][2]
+        const __m128d y = _mm_unpacklo_pd(a_yx, a_yx), x = _mm_unpackhi_pd(a_yx, a_yx);  // A[i][1], A[i][0]
+        const __m128d s_lo = _mm_add_pd(_mm_add_pd(_mm_mul_pd(w, lo[3]), _mm_mul_pd(y, lo[1])),
+                                        _mm_add_pd(_mm_mul_pd(z, lo[2]), _mm_mul_pd(x, lo[0])));
+        const __m128d s_hi = _mm_add_pd(_mm_add_pd(_mm_mul_pd(w, hi[3]), _mm_mul_pd(y, hi[1])),
+                                        _mm_add_pd(_mm_mul_pd(z, hi[2]), _mm_mul_pd(x, hi[0])));
+        out[i] = _mm_movelh_ps(_mm_cvtpd_ps(s_lo), _mm_cvtpd_ps(s_hi));
+    }
 }
 // Computes the 4 output rows (already byte-reversed for big-endian storing) into out[4].
 inline void Mul(u8* b, u32 ra, u32 rb, __m128i out[4]) {
     const __m128i rev = _mm_load_si128(reinterpret_cast<const __m128i*>(rex::ppc::VectorMaskL));
-    auto L = [&](u32 a) { return _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(G(b, a))), rev); };
-    const __m128i B0 = L(rb), B1 = L(rb + 16), B2 = L(rb + 32), B3 = L(rb + 48);
-    const __m128 A0 = _mm_castsi128_ps(L(ra)), A1 = _mm_castsi128_ps(L(ra + 16));
-    const __m128 A2 = _mm_castsi128_ps(L(ra + 32)), A3 = _mm_castsi128_ps(L(ra + 48));
-    // v0 = B2, v11 = B0, v9 = B3, v8 = B1 (as loaded by the original)
-    __m128i v13 = _mm_unpackhi_epi32(B2, B0);
-    __m128i v11 = _mm_unpacklo_epi32(B2, B0);
-    __m128i v12 = _mm_unpackhi_epi32(B3, B1);
-    __m128i v7 = _mm_unpacklo_epi32(B3, B1);
-    const __m128 c0 = _mm_castsi128_ps(_mm_unpackhi_epi32(v12, v13));
-    const __m128 c1 = _mm_castsi128_ps(_mm_unpacklo_epi32(v12, v13));
-    const __m128 c2 = _mm_castsi128_ps(_mm_unpackhi_epi32(v7, v11));
-    const __m128 c3 = _mm_castsi128_ps(_mm_unpacklo_epi32(v7, v11));
-    // v10 = A0, v9 = A1, v8 = A2, v10' = A3
-    const __m128i d7 = _mm_castps_si128(_mm_dp_ps(A0, c0, 0xFF)), d3 = _mm_castps_si128(_mm_dp_ps(A0, c2, 0xFF));
-    const __m128i d2 = _mm_castps_si128(_mm_dp_ps(A0, c3, 0xFF)), d6 = _mm_castps_si128(_mm_dp_ps(A0, c1, 0xFF));
-    const __m128i d5 = _mm_castps_si128(_mm_dp_ps(A1, c0, 0xFF)), d4 = _mm_castps_si128(_mm_dp_ps(A1, c1, 0xFF));
-    const __m128i d1 = _mm_castps_si128(_mm_dp_ps(A1, c2, 0xFF)), d9 = _mm_castps_si128(_mm_dp_ps(A1, c3, 0xFF));
-    const __m128i d30 = _mm_castps_si128(_mm_dp_ps(A2, c2, 0xFF)), d28 = _mm_castps_si128(_mm_dp_ps(A3, c0, 0xFF));
-    const __m128i d12 = _mm_castps_si128(_mm_dp_ps(A3, c2, 0xFF)), d31 = _mm_castps_si128(_mm_dp_ps(A2, c0, 0xFF));
-    const __m128i d29 = _mm_castps_si128(_mm_dp_ps(A2, c1, 0xFF)), d27 = _mm_castps_si128(_mm_dp_ps(A3, c1, 0xFF));
-    const __m128i d26 = _mm_castps_si128(_mm_dp_ps(A3, c3, 0xFF)), d8 = _mm_castps_si128(_mm_dp_ps(A2, c3, 0xFF));
-    __m128i v0 = _mm_unpackhi_epi32(d3, d7);
-    __m128i w13 = _mm_unpackhi_epi32(d2, d6);
-    __m128i w11 = _mm_unpackhi_epi32(d1, d5);
-    __m128i w10 = _mm_unpackhi_epi32(d9, d4);
-    v0 = _mm_unpackhi_epi32(w13, v0);
-    w13 = _mm_unpackhi_epi32(d12, d28);
-    const __m128i w12 = _mm_unpackhi_epi32(w10, w11);
-    const __m128i w9 = _mm_unpackhi_epi32(d30, d31);
-    w11 = _mm_unpackhi_epi32(d26, d27);
-    const __m128i w8 = _mm_unpackhi_epi32(d8, d29);
-    out[0] = _mm_shuffle_epi8(v0, rev);                              // -> r3
-    out[1] = _mm_shuffle_epi8(w12, rev);                             // -> r3 + 16
-    out[3] = _mm_shuffle_epi8(_mm_unpackhi_epi32(w11, w13), rev);    // -> r3 + 48
-    out[2] = _mm_shuffle_epi8(_mm_unpackhi_epi32(w8, w9), rev);      // -> r3 + 32
+    auto L = [&](u32 a) {
+        return _mm_castsi128_ps(_mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(G(b, a))), rev));
+    };
+    __m128 a[4], bm[4], r[4];
+    for (int k = 0; k < 4; ++k) a[k] = L(ra + 16 * k), bm[k] = L(rb + 16 * k);
+    MulRows(a, bm, r);
+    for (int i = 0; i < 4; ++i) out[i] = _mm_shuffle_epi8(_mm_castps_si128(r[i]), rev);  // -> r3 + 16 * i
+}
+// Drift guard: the arithmetic is written twice (MulRows here, simde_mm_vmsum4fp128 in the SDK).
+// SelfCheck compares MulRows, bit for bit, with 16 simde_mm_vmsum4fp128 calls in the original's
+// layout (out row i lane l = A row i . B column 3 - l) on 4 fixed matrix products. The results
+// change if either side adds the four products in another order, rounds the products to single
+// precision or rounds a partial sum to single precision. If they differ, Mode() logs an error and
+// the original runs.
+bool SelfCheck() {
+    constexpr float tiny = 0x1p-60f, big = 0x1p40f;
+    constexpr float inexact = 1 + 0x1p-12f;     // inexact^2 = 1 + 2^-11 + 2^-24 is not a float
+    constexpr float rounded_sq = 1 + 0x1p-11f;  // inexact^2 rounded to float
+    // matrix[0] * matrix[1]: rows 0-2 . columns 1-3 (ones) cancel and absorb tiny (sum order);
+    // row 3 . column 0 = inexact^2 - rounded_sq = 2^-24, 0 with rounded products or partial sums.
+    // matrix[4] * matrix[5]: row 0 . column 0 = (1 + 2^-30) - 1 = 2^-30, 0 with (w + y) rounded.
+    static const float matrix[6][16] = {  // row-major
+        {tiny, tiny, -1, 1, -1, tiny, tiny, 1, 1, -1, tiny, tiny, inexact, 1, 0, 0},
+        {inexact, 1, 1, 1, -rounded_sq, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1},
+        {3, -big, 0x1p-20f, 7, big, 1.5f, -big, 0x1p-30f, -2, 0.1f, 5, -0.3f, 0x1p60f, -1, 0x1p-40f, 1},
+        {0.5f, 1e-7f, -3, big, 2, -0x1p30f, 0x1p30f, 1, -1e5f, 7, 0x1p-12f, 1, 1, 0x1p-40f, -1, 0x1p20f},
+        {0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {0, 0, 0, 0, 0x1p-30f, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0},
+    };
+    static const int pairs[4][2] = {{0, 1}, {2, 3}, {3, 2}, {4, 5}};  // A, B
+    const unsigned csr = _mm_getcsr();
+    _mm_setcsr(0x1F80);  // round to nearest, no flush, as when the compiler folds constants
+    bool ok = true;
+    for (const auto& p : pairs) {
+        const float *A = matrix[p[0]], *B = matrix[p[1]];
+        __m128 a[4], bm[4], got[4];
+        for (int k = 0; k < 4; ++k) {
+            a[k] = _mm_set_ps(A[4 * k], A[4 * k + 1], A[4 * k + 2], A[4 * k + 3]);
+            bm[k] = _mm_set_ps(B[4 * k], B[4 * k + 1], B[4 * k + 2], B[4 * k + 3]);
+        }
+        MulRows(a, bm, got);
+        for (int i = 0; i < 4; ++i) {
+            float d[4];  // d[j] = A row i . B column j
+            for (int j = 0; j < 4; ++j) {
+                const __m128 col = _mm_set_ps(B[j], B[4 + j], B[8 + j], B[12 + j]);
+                d[j] = _mm_cvtss_f32(rex::ppc::simde_mm_vmsum4fp128(a[i], col));
+            }
+            const __m128i want = _mm_castps_si128(_mm_set_ps(d[0], d[1], d[2], d[3]));
+            ok &= _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_castps_si128(got[i]), want)) == 0xFFFF;
+        }
+    }
+    _mm_setcsr(csr);
+    return ok;
+}
+// Verify compare of one output row (byte-reversed) with guest memory: per 32-bit word, equal bits
+// or both NaN (the NaN payload can differ, see the top).
+inline bool SameRow(const __m128i& o, const u8* g) {
+    for (int k = 0; k < 4; ++k) {
+        u32 x, y;
+        std::memcpy(&x, reinterpret_cast<const u8*>(&o) + 4 * k, 4);
+        std::memcpy(&y, g + 4 * k, 4);
+        if (x != y && ((__builtin_bswap32(x) & 0x7FFFFFFFu) <= 0x7F800000u ||
+                       (__builtin_bswap32(y) & 0x7FFFFFFFu) <= 0x7F800000u))
+            return false;
+    }
+    return true;
+}
+int Mode() {
+    static const int m = [] {
+        if (FILE* f = std::fopen("native_math_off", "rb")) { std::fclose(f); return 0; }
+        if (!SelfCheck()) {
+            REXLOG_ERROR("NATIVE MATH: self-check against simde_mm_vmsum4fp128 failed, the original runs");
+            return 0;
+        }
+        if (FILE* f = std::fopen("native_math_verify", "rb")) { std::fclose(f); return 2; }
+        return 1;
+    }();
+    return m;
 }
 std::atomic<uint64_t> v_calls{0}, v_bad{0}, unaligned{0};
 std::atomic<int64_t> v_last{0};
@@ -78,7 +139,7 @@ PPC_FUNC(sub_8219DFC0) {
             __imp__sub_8219DFC0(ctx, base);
             bool bad = false;
             for (int k = 0; k < 4; ++k)
-                bad |= std::memcmp(&o[k], G(base, (r3 + 16 * k) & ~15u), 16) != 0;
+                bad |= !SameRow(o[k], G(base, (r3 + 16 * k) & ~15u));
             ++v_calls;
             if (bad) ++v_bad;
             const int64_t now = int64_t(GetTickCount64());
