@@ -89,6 +89,7 @@ set(SAINTSROW_SOURCES
     src/gangs_bridge.cpp
     src/keyboard_ui.cpp
     src/friends_ui.cpp
+    src/achievements_ui.cpp
     ${REXGLUE_SHARE_DIR}/rex_app.cpp
     res/saintsreborn.rc
 )
