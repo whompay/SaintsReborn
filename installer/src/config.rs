@@ -1,9 +1,15 @@
 //! Fixed settings: where things are downloaded from and what they must hash to.
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const REPO_URL: &str = "https://github.com/whompay/SaintsReborn.git";
+pub const REPO_URL: &str = match option_env!("SR_FORK_REPO_URL") {
+    Some(url) => url,
+    None => "https://github.com/whompay/SaintsReborn.git",
+};
 pub const REPO_PAGE: &str = "https://github.com/whompay/SaintsReborn";
-pub const BRANCH: &str = "main";
+pub const BRANCH: &str = match option_env!("SR_FORK_BRANCH") {
+    Some(branch) => branch,
+    None => "main",
+};
 
 pub const SDK_REPO: &str = "https://github.com/rexglue/rexglue-sdk.git";
 /// Used when the downloaded source does not name an SDK commit itself.
@@ -17,7 +23,7 @@ pub const ONLINE_PACK_URL: &str =
 
 /// Changes whenever the compiler or the Microsoft libraries change, so old
 /// build folders (made with another toolchain) are rebuilt from scratch.
-pub const TOOLCHAIN_ID: &str = "llvm-19.1.5+msvc-14.44.17.14+sdk-10.0.26100+r2";
+pub const TOOLCHAIN_ID: &str = "llvm-19.1.5+msvc-14.44.17.14+sdk-10.0.26100+r3-linux-bootstrap";
 
 /// Needs to match the clang that recorded the profiles in pgo\.
 pub const LLVM_VERSION: &str = "19.1.5";

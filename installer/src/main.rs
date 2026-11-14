@@ -3,10 +3,15 @@
 //! Linux. Downloads a portable build toolchain (no Visual Studio), builds the
 //! game from the player's own disc, and keeps it up to date.
 #![windows_subsystem = "windows"]
+// Without the window (the Linux setup builds it that way) some helpers only it uses are idle.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
 mod config;
 mod fsx;
+#[cfg(feature = "gui")]
 mod gui;
+#[cfg(target_os = "linux")]
+mod linux;
 mod online;
 mod pipeline;
 mod platform;
@@ -126,21 +131,29 @@ fn main() {
         return;
     }
 
-    let update = has("--update");
-    let dir = value("--dir");
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Saints Reborn Setup")
-            .with_inner_size([760.0, 560.0])
-            .with_min_inner_size([620.0, 460.0]),
-        ..Default::default()
-    };
-    let _ = eframe::run_native(
-        "Saints Reborn Setup",
-        options,
-        Box::new(move |cc| {
-            cc.egui_ctx.set_theme(eframe::egui::Theme::Dark);
-            Ok(Box::new(gui::SetupApp::new(update, dir)))
-        }),
-    );
+    #[cfg(feature = "gui")]
+    {
+        let update = has("--update");
+        let dir = value("--dir");
+        let options = eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_title("Saints Reborn Setup")
+                .with_inner_size([760.0, 560.0])
+                .with_min_inner_size([620.0, 460.0]),
+            ..Default::default()
+        };
+        let _ = eframe::run_native(
+            "Saints Reborn Setup",
+            options,
+            Box::new(move |cc| {
+                cc.egui_ctx.set_theme(eframe::egui::Theme::Dark);
+                Ok(Box::new(gui::SetupApp::new(update, dir)))
+            }),
+        );
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        eprintln!("Use the Linux Setup launcher, or pass --cli.\n\n{HELP}");
+        std::process::exit(2);
+    }
 }
