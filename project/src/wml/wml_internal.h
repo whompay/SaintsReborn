@@ -48,6 +48,8 @@ void ForceKey(int virtual_key, bool down);
 void TurnCamera(double radians);
 // Picture look (see wml.h set_look); count 0 = original.
 void SetLook(const float* data, int count);
+// The last look a mod set with set_look (14 values); false = none.
+bool LastLook(float* out14);
 
 // Register access by index (r0-r31, f0-f31).
 uint64_t GetR(PPCContext& ctx, int index);

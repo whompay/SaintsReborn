@@ -28,6 +28,7 @@
 #include "saintsrow_config.h"
 #include "saintsrow_init.h"
 #include "options_menu.h"
+#include "native_renderer_bridge.h"
 #include "wml/mod_loader.h"
 
 #include <rex/logging.h>
@@ -50,6 +51,8 @@ extern "C" __declspec(dllimport) unsigned long long __stdcall GetTickCount64(voi
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <filesystem>
+#include <iterator>
 
 extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId(void);
 extern "C" uint32_t sr_render_list_cap();
@@ -751,6 +754,57 @@ float AlBoost() {
     }
     return value;
 }
+// 18. Air-view far-city cost (2026-10-25): from the air ~1000 objects of the
+// low-detail "al" chunks pass the fade test each frame (95 % of those tested),
+// each drawn in the depth pre-pass and the colour pass (~6900 more draws per
+// frame than at street level, half the frame rate). Both cuts below are off
+// unless their file exists in dist (default = behaviour as before):
+//   "air_al_cut": small (box radius < 40 m) non-ground al objects further than
+//     300 m whose radius / distance is below air_al_cut.txt (default 0.004,
+//     about a 4 pixel radius at 1080p) are not drawn; an object drawn in the
+//     last 300 ms must be clearly below (80 %) to go (no flicker at the edge).
+//   "al_boost_classify": small al objects (radius < 15 m, not flat ground)
+//     get the fade boost al_boost_small.txt (default 1.5) instead of
+//     al_fade_boost (3); ground, roofs and big buildings keep the full boost.
+//   "air_al_hist": 10 s log "AL SIZE" of the drawn al objects by radius /
+//     distance and distance (for choosing the values above).
+float FileValue(const char* name, float def, float lo, float hi, std::atomic<float>& cache,
+                std::atomic<int64_t>& next_ms) {
+    const int64_t now = int64_t(GetTickCount64());
+    if (now >= next_ms.load(std::memory_order_relaxed)) {
+        next_ms.store(now + 1000, std::memory_order_relaxed);
+        float v = def;
+        if (FILE* f = std::fopen(name, "rb")) {
+            if (std::fscanf(f, "%f", &v) != 1) v = def;
+            std::fclose(f);
+        }
+        cache.store((v >= lo && v <= hi) ? v : def, std::memory_order_relaxed);
+    }
+    return cache.load(std::memory_order_relaxed);
+}
+float AlCutK() {
+    static std::atomic<float> v{0.004f};
+    static std::atomic<int64_t> n{0};
+    return FileValue("air_al_cut.txt", 0.004f, 0.0f, 0.05f, v, n);
+}
+float AlSmallBoost() {
+    static std::atomic<float> v{1.5f};
+    static std::atomic<int64_t> n{0};
+    return FileValue("al_boost_small.txt", 1.5f, 1.0f, 20.0f, v, n);
+}
+std::atomic<uint32_t> g_al_cut{0};
+// LOOK11 l11e "air_detail_cut": small (r < 40 m) non-ground DETAIL objects (not al) further than 100 m whose
+// radius / distance is below air_detail_cut.txt (default 0.008, "air_detail_cut16" = 0.016) are not drawn in
+// air view (sticky 0.8 for objects drawn in the last 300 ms). air_al_hist also logs 'DETAIL SIZE'.
+float DetailCutK() {
+    static std::atomic<float> v{0.008f};
+    static std::atomic<int64_t> n{0};
+    return FileValue("air_detail_cut.txt", 0.008f, 0.0f, 0.05f, v, n);
+}
+std::atomic<uint32_t> g_detail_cut{0}, g_det_rd[6] = {};
+// AL SIZE histogram: drawn al objects by radius / distance (< .002 .004 .008 .016 .032 more) and
+// distance (< 300 600 1200 2400 m, more).
+std::atomic<uint32_t> g_al_rd[6] = {}, g_al_dist[5] = {};
 std::atomic<uint32_t> g_al_tests{0}, g_al_drawn{0}, g_al_fade_sum{0};
 std::atomic<uint64_t> g_ground_forced{0};
 // Why the fade test (82129550) rejected an object within 80 m of the camera in air view (AIRFLICKER log):
@@ -817,12 +871,185 @@ int CallerIndex(uint32_t lr) {
 }
 constexpr uint32_t kSlots = 1u << 16;
 Entry table[kSlots];
+std::atomic<uint64_t> g_cut_sticky[kSlots] = {};  // LOOK11: air_al_cut sticky, (rec << 32) | drawn ms
 inline uint32_t Hash(uint32_t r) { return (r * 2654435761u) >> 16; }
 inline uint32_t NowMs() {
     // 2026-10-02: GetTickCount64 (shared-page read) instead of QPC - called per fade test (~1 % of busy CPU).
     return uint32_t(GetTickCount64()) | 1u;
 }
 }  // namespace fade_hysteresis
+
+// 18b. (LOOK11) FAR AL OUT OF THE DEPTH PRE-PASS, file "air_al_noprepass" (default absent = unchanged).
+// In air view every accepted al object is drawn twice: depth pre-pass (822347C0 pass 7 -> 8223DA00,
+// render thread, the air-view bottleneck) and colour (pass 8). The main pass has its own depth buffer;
+// the pre-pass only feeds its resolved depth to effects. Non-ground al objects further than
+// air_al_noprepass.txt m (default 600) with a box radius < 60 m are marked when the fade test accepts
+// them: the thread-local flag is set around the original 82129550, the instance allocator 82194B78
+// (render_inst_pool, reset once per frame) marks / unmarks the returned 248-byte instance, and
+// 822347C0 skips pass 7 for marked instances (returns 1 = drawn). Log 'AL NOPREPASS' every 10 s.
+namespace al_noprepass {
+// "air_al_noprepass_all" (with air_al_noprepass) = upper-bound test: every non-ground al object beyond 150 m.
+bool All() { static const bool on = FileExists("air_al_noprepass_all"); return on; }
+// "air_prepass_far" (LOOK11 l11d): EVERY object (detail, al, ground) whose nearest box edge is further than
+// air_prepass_far.txt m (default 150; "air_prepass_far300" = 300 m) skips the pre-pass in air view.
+bool Far300() { static const bool on = FileExists("air_prepass_far300"); return on; }
+// "prepass_far" (NATIVE24B, GPU cut for the GPU-bound normal view): the same far skip in EVERY view (not only air view):
+// every object whose nearest box edge is further than prepass_far.txt m (default 150; "prepass_far300" = 300 m) skips
+// the depth/stencil pre-pass (pass 7; its only live output is the 0E93C000 shadow/fade mask). Log 'PREPASS FAR' / 10 s.
+bool FarAll300() { static const bool on = FileExists("prepass_far300"); return on; }
+bool FarAll() { static const bool on = FileExists("prepass_far") || FarAll300(); return on; }
+bool FarOn() { static const bool on = FileExists("air_prepass_far") || Far300() || FarAll(); return on; }
+float FarDist() {
+    if (FarAll300()) return 300.0f;
+    if (FarAll()) {
+        static std::atomic<float> v{150.0f};
+        static std::atomic<int64_t> n{0};
+        return fade_hysteresis::FileValue("prepass_far.txt", 150.0f, 30.0f, 50000.0f, v, n);
+    }
+    if (Far300()) return 300.0f;
+    static std::atomic<float> v{150.0f};
+    static std::atomic<int64_t> n{0};
+    return fade_hysteresis::FileValue("air_prepass_far.txt", 150.0f, 30.0f, 50000.0f, v, n);
+}
+bool On() { static const bool on = FileExists("air_al_noprepass") || All() || FarOn(); return on; }
+float Dist() {
+    if (All()) return 150.0f;
+    static std::atomic<float> v{600.0f};
+    static std::atomic<int64_t> n{0};
+    return fade_hysteresis::FileValue("air_al_noprepass.txt", 600.0f, 50.0f, 50000.0f, v, n);
+}
+thread_local bool t_pending = false;
+constexpr uint32_t kMarks = 1u << 16;
+std::atomic<uint32_t> marks[kMarks] = {};
+inline uint32_t Slot(uint32_t inst) { return ((inst >> 3) * 2654435761u) >> 16; }
+// AIR DRAW CENSUS (LOOK11 diagnostic, file "air_draw_census"): every object the fade test accepts in air view
+// gets a class = al*12 + ground*6 + distance bucket (<100 <300 <600 <1200 <2400 more m); class 24 = instance
+// not allocated from the fade test. Per class: pass-7 (depth pre-pass) and pass-8 (colour) instance renders and
+// the DrawIndexed calls made inside them. Log 'AIR DRAW CENSUS' every 10 s (per frame).
+bool CensusOn() { static const bool on = FileExists("air_draw_census"); return on; }
+constexpr int kCats = 25;
+thread_local int t_cat = -1;               // class of the object being fade-tested (set around the original)
+thread_local int t_draw = -1;              // (pass index 0/1) * kCats + class while inside 822347C0
+std::atomic<uint8_t> cat_of[kMarks] = {};
+std::atomic<uint32_t> c_inst[2][kCats] = {}, c_draws[2][kCats] = {}, c_frames{0};
+inline int CatOf(bool is_al, bool ground, float d) {
+    int b = d < 100.0f ? 0 : d < 300.0f ? 1 : d < 600.0f ? 2 : d < 1200.0f ? 3 : d < 2400.0f ? 4 : 5;
+    return (is_al ? 12 : 0) + (ground ? 6 : 0) + b;
+}
+inline void OnDraw() {
+    if (t_draw >= 0) c_draws[t_draw / kCats][t_draw % kCats].fetch_add(1, std::memory_order_relaxed);
+}
+void CensusLog() {  // once per frame (82194BD8)
+    static std::atomic<int64_t> next{0};
+    c_frames.fetch_add(1, std::memory_order_relaxed);
+    const int64_t now = int64_t(GetTickCount64());
+    int64_t n = next.load(std::memory_order_relaxed);
+    if (now - n < 10000 || !next.compare_exchange_strong(n, now)) return;
+    const double f = double(c_frames.exchange(0));
+    uint32_t v[2][2][kCats];
+    for (int p = 0; p < 2; ++p)
+        for (int c = 0; c < kCats; ++c) {
+            v[0][p][c] = c_inst[p][c].exchange(0);
+            v[1][p][c] = c_draws[p][c].exchange(0);
+        }
+    if (!n || f < 1) return;
+    static const char* kGrp[4] = {"detail", "detail-ground", "AL", "AL-ground"};
+    for (int p = 0; p < 2; ++p) {
+        std::string t;
+        uint64_t ti = 0, td = 0;
+        for (int g = 0; g < 4; ++g) {
+            t += fmt::format(" | {}", kGrp[g]);
+            for (int b = 0; b < 6; ++b) {
+                const int c = g * 6 + b;
+                t += fmt::format(" {:.0f}/{:.0f}", v[0][p][c] / f, v[1][p][c] / f);
+                ti += v[0][p][c]; td += v[1][p][c];
+            }
+        }
+        ti += v[0][p][24]; td += v[1][p][24];
+        static int lines = 0;
+        if (lines++ < 400)
+            REXLOG_INFO("AIR DRAW CENSUS {} per frame (inst/draws by <100 <300 <600 <1200 <2400 more m): total {:.0f}/{:.0f}"
+                        "{} | other {:.0f}/{:.0f}", p ? "colour p8" : "pre-pass p7", ti / f, td / f, t,
+                        v[0][p][24] / f, v[1][p][24] / f);
+    }
+}
+struct InstScope {
+    bool on;
+    explicit InstScope(const PPCContext& ctx) : on(false) {
+        if (!CensusOn()) return;
+        const uint32_t pass = ctx.r4.u32, inst = ctx.r3.u32;
+        if (pass != 7 && pass != 8) return;
+        const uint32_t slot = Slot(inst) & (kMarks - 1);
+        int c = 24;
+        if (inst && marks[slot].load(std::memory_order_relaxed) == inst) c = cat_of[slot].load(std::memory_order_relaxed) & 0x7F;
+        if (c >= kCats) c = 24;
+        const int pi = pass == 8 ? 1 : 0;
+        c_inst[pi][c].fetch_add(1, std::memory_order_relaxed);
+        t_draw = pi * kCats + c;
+        on = true;
+    }
+    ~InstScope() { if (on) t_draw = -1; }
+};
+std::atomic<uint32_t> g_marked{0}, g_p7_skipped{0}, g_p7_seen{0}, g_p8_marked{0}, g_p8_seen{0};
+void OnAlloc(uint32_t inst) {
+    if (!inst) return;
+    const uint32_t slot = Slot(inst) & (kMarks - 1);
+    std::atomic<uint32_t>& m = marks[slot];
+    if (CensusOn()) {  // census: every instance gets its class; the noprepass mark is bit 7 of the class
+        const int c = t_cat >= 0 ? t_cat : 24;
+        m.store(inst, std::memory_order_relaxed);
+        cat_of[slot].store(uint8_t(c | (t_pending ? 0x80 : 0)), std::memory_order_relaxed);
+        if (t_pending) g_marked.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (t_pending) {
+        m.store(inst, std::memory_order_relaxed);
+        g_marked.fetch_add(1, std::memory_order_relaxed);
+    } else if (m.load(std::memory_order_relaxed) == inst) {
+        m.store(0, std::memory_order_relaxed);
+    }
+}
+bool Marked(uint32_t inst) {
+    if (!inst) return false;
+    const uint32_t slot = Slot(inst) & (kMarks - 1);
+    if (marks[slot].load(std::memory_order_relaxed) != inst) return false;
+    return !CensusOn() || (cat_of[slot].load(std::memory_order_relaxed) & 0x80);
+}
+// true = skip this instance render (pre-pass of a marked far al object)
+bool Skip(PPCContext& ctx) {
+    if (!On()) return false;
+    const uint32_t pass = ctx.r4.u32, inst = ctx.r3.u32;
+    if (pass == 7) {
+        g_p7_seen.fetch_add(1, std::memory_order_relaxed);
+        if (Marked(inst)) {
+            g_p7_skipped.fetch_add(1, std::memory_order_relaxed);
+            ctx.r3.u64 = 1;
+            return true;
+        }
+    } else if (pass == 8) {
+        g_p8_seen.fetch_add(1, std::memory_order_relaxed);
+        if (Marked(inst)) g_p8_marked.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+}
+// NATIVE24B: per-frame log for prepass_far (any view), called once per frame from 82194BD8.
+void FarLog() {
+    static std::atomic<int64_t> next{0};
+    static std::atomic<uint32_t> frames{0};
+    frames.fetch_add(1, std::memory_order_relaxed);
+    const int64_t now = int64_t(GetTickCount64());
+    int64_t n = next.load(std::memory_order_relaxed);
+    if (now - n < 10000 || !next.compare_exchange_strong(n, now)) return;
+    const double f = double(frames.exchange(0));
+    const uint32_t mk = g_marked.exchange(0), p7 = g_p7_seen.exchange(0), p7s = g_p7_skipped.exchange(0),
+                   p8 = g_p8_seen.exchange(0), p8m = g_p8_marked.exchange(0);
+    static int lines = 0;
+    if (n && f >= 1 && lines++ < 400)
+        REXLOG_INFO("PREPASS FAR 10 s (> {:.0f} m, air view {}): per frame marked {:.0f} | pre-pass instance renders {:.0f} "
+                    "skipped {:.0f} | colour instance renders {:.0f} of them marked {:.0f}", FarDist(),
+                    far_clip::g_air_view ? 1 : 0, mk / f, p7 / f, p7s / f, p8 / f, p8m / f);
+}
+}  // namespace al_noprepass
 
 extern "C" void __imp__sub_82129550(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_82129550) {
@@ -831,7 +1058,14 @@ PPC_FUNC(sub_82129550) {
     const float k = Factor();
     const uint32_t slot = ctx.r3.u32, object = ctx.r4.u32;
     uint32_t rec = 0, chunk = 0;
-    if (k > 1.0f && slot < 256) {
+    // LOOK11 (codex19 #1): the air-view AL switches need rec even when fade_hysteresis.txt = 1.
+    static const bool al_new_any = FileExists("air_al_cut") || FileExists("al_boost_classify") ||
+                                   FileExists("air_al_hist") || FileExists("air_al_noprepass") ||
+                                   FileExists("air_al_noprepass_all") || FileExists("air_draw_census") ||
+                                   FileExists("air_prepass_far") || FileExists("air_prepass_far300") ||
+                                   FileExists("prepass_far") || FileExists("prepass_far300") ||
+                                   FileExists("air_detail_cut") || FileExists("air_detail_cut16");
+    if ((k > 1.0f || al_new_any) && slot < 256) {
         chunk = Rd32(base, 0x829A97F8 + slot * 4);
         const uint32_t records = chunk ? Rd32(base, chunk + 216) : 0;
         if (records) rec = records + object * 80;
@@ -876,7 +1110,35 @@ PPC_FUNC(sub_82129550) {
         if (flat) gb = GroundBoost();
     }
     const bool al = far_clip::g_air_view && chunk && (base[chunk + 20] & 0x80);
-    if (al) gb = std::max(gb, AlBoost());
+    // LOOK11 (codex19 #4/#9): AABB metrics of an al object computed ONCE (only when a switch needs
+    // them) and ONE ground predicate for classify + cut (flat OR ground cover: < 4 m tall, > 3 m across).
+    static const bool classify = FileExists("al_boost_classify");
+    static const bool al_cut_on = FileExists("air_al_cut");
+    static const bool al_hist_on = FileExists("air_al_hist");
+    static const bool det16 = FileExists("air_detail_cut16");
+    static const bool det_cut_on = FileExists("air_detail_cut") || det16;
+    struct AlMetrics { bool ok = false, ground = false; float r = 0.0f, d = 0.0f; } am;
+    const bool noprepass_on = al_noprepass::On();
+    const bool census_on =
+        (al_noprepass::CensusOn() || al_noprepass::FarOn()) && (far_clip::g_air_view || al_noprepass::FarAll());
+    if ((al && (classify || al_cut_on || al_hist_on || noprepass_on)) || census_on ||
+        (far_clip::g_air_view && (det_cut_on || al_hist_on))) {
+        auto f = [&](uint32_t a) { return RdF(base, rec + a); };
+        const float x0 = f(0), y0 = f(4), z0 = f(8), x1 = f(16), y1 = f(20), z1 = f(24);
+        const float sx = x1 - x0, sy = y1 - y0, sz = z1 - z0;
+        const float cx = RdF(base, 0x827D9778 + 44), cy = RdF(base, 0x827D9778 + 48), cz = RdF(base, 0x827D9778 + 52);
+        const float mx = 0.5f * (x0 + x1) - cx, my = 0.5f * (y0 + y1) - cy, mz = 0.5f * (z0 + z1) - cz;
+        am.r = 0.5f * std::sqrt(sx * sx + sy * sy + sz * sz);
+        am.d = std::sqrt(mx * mx + my * my + mz * mz);
+        am.ok = std::isfinite(am.r) && std::isfinite(am.d) && sx >= 0.0f && sy >= 0.0f && sz >= 0.0f;
+        const bool ground_cover = am.ok && sy < 4.0f && std::max(sx, sz) > 3.0f && sx < 5000.0f && sz < 5000.0f;
+        am.ground = flat || ground_cover;
+    }
+    if (al) {
+        float boost = AlBoost();
+        if (classify && am.ok && !am.ground && am.r < 15.0f) boost = std::min(boost, AlSmallBoost());
+        gb = std::max(gb, boost);
+    }
     const float kk = std::max(was ? k : 1.0f, gb);
     // Air view: big objects are judged by the distance to their MIDDLE; a
     // terrain piece 300 m across can have its middle far away while its edge
@@ -945,6 +1207,34 @@ PPC_FUNC(sub_82129550) {
             }
         }
     }
+    {
+        if (det_cut_on && far_clip::g_air_view && !al && am.ok && !am.ground) {
+            const uint64_t sv = g_cut_sticky[Hash(rec) & (kSlots - 1)].load(std::memory_order_relaxed);
+            const bool recent = uint32_t(sv >> 32) == rec && now - uint32_t(sv) < 300u;
+            const float kd = det16 ? 0.016f : DetailCutK();
+            const float kk_cut = recent ? kd * 0.8f : kd;
+            if (am.d > 100.0f && am.r < 40.0f && am.r < kk_cut * am.d) {
+                g_detail_cut.fetch_add(1, std::memory_order_relaxed);
+                Wr32(base, rec + 28, own);  // undo the widened fade distance written above
+                ctx.r3.u64 = 0;
+                return;
+            }
+        }
+        if (al_cut_on && al && am.ok && !am.ground) {
+            // LOOK11 (codex19 #5): sticky = one packed (rec << 32 | drawn ms) word -> the time belongs to this rec.
+            const uint64_t sv = g_cut_sticky[Hash(rec) & (kSlots - 1)].load(std::memory_order_relaxed);
+            const bool recent = uint32_t(sv >> 32) == rec && now - uint32_t(sv) < 300u;
+            const float k_al = AlCutK();
+            const float kk_cut = recent ? k_al * 0.8f : k_al;
+            const float r = am.r, d = am.d;
+            if (d > 300.0f && r < 40.0f && r < kk_cut * d) {
+                g_al_cut.fetch_add(1, std::memory_order_relaxed);
+                Wr32(base, rec + 28, own);  // undo the widened fade distance written above
+                ctx.r3.u64 = 0;
+                return;
+            }
+        }
+    }
     // Pre-state for the rejection reasons (same reads as the original's early checks).
     int reason = -1;
     float near_d = 1e9f;
@@ -972,7 +1262,15 @@ PPC_FUNC(sub_82129550) {
             if (rd) counter_addr = rd + (r6 == 1 ? 12 : r6 == 2 ? 16 : 8);
         }
     }
+    const bool np_mark =
+        noprepass_on && am.ok &&
+        ((al && !am.ground && (al_noprepass::All() || am.r < 60.0f) && am.d > al_noprepass::Dist()) ||
+         (al_noprepass::FarOn() && am.d - am.r > al_noprepass::FarDist()));
+    al_noprepass::t_pending = np_mark;
+    al_noprepass::t_cat = (census_on && am.ok) ? al_noprepass::CatOf(al, am.ground, am.d) : -1;
     __imp__sub_82129550(ctx, base);
+    al_noprepass::t_pending = false;
+    al_noprepass::t_cat = -1;
     if (near_d < 80.0f) {
         g_near_tests.fetch_add(1, std::memory_order_relaxed);
         if (ctx.r3.u32 & 0xFF) g_near_drawn.fetch_add(1, std::memory_order_relaxed);
@@ -1028,6 +1326,19 @@ PPC_FUNC(sub_82129550) {
     if (al) {
         g_al_tests.fetch_add(1, std::memory_order_relaxed);
         if (result) g_al_drawn.fetch_add(1, std::memory_order_relaxed);
+        static const bool al_hist = FileExists("air_al_hist");
+        if (al_hist && result && am.ok) {
+            const float r = am.r, dd = am.d;
+            if (dd > 1.0f) {
+                const float q = r / dd;
+                int i = 0;
+                for (float lim = 0.002f; i < 5 && q >= lim; lim *= 2.0f) ++i;
+                g_al_rd[i].fetch_add(1, std::memory_order_relaxed);
+                int j = 0;
+                for (float lim = 300.0f; j < 4 && dd >= lim; lim *= 2.0f) ++j;
+                g_al_dist[j].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (std::isfinite(of) && of > 0.0f) g_al_fade_sum.fetch_add(uint32_t(std::sqrt(of)), std::memory_order_relaxed);
         static std::atomic<int64_t> next_log{0};
         const int64_t t = now;
@@ -1040,6 +1351,34 @@ PPC_FUNC(sub_82129550) {
             if (n && lines++ < 200)
                 REXLOG_INFO("AL FADE (air view, x{:.1f}): {} far-city objects tested, {} drawn, their own fade distance "
                             "avg {:.0f} m", AlBoost(), tests, drawn, tests ? double(sum) / tests : 0.0);
+            const uint32_t cut = g_al_cut.exchange(0);
+            uint32_t rd[6], di[5];
+            for (int i = 0; i < 6; ++i) rd[i] = g_al_rd[i].exchange(0);
+            for (int i = 0; i < 5; ++i) di[i] = g_al_dist[i].exchange(0);
+            static int size_lines = 0;
+            if (n && size_lines++ < 200 && (cut || rd[0] + rd[1] + rd[2] + rd[3] + rd[4] + rd[5]))
+                REXLOG_INFO("AL SIZE 10 s: cut {} (k {:.4f}) | drawn by radius/distance <.002 {} <.004 {} <.008 {} "
+                            "<.016 {} <.032 {} more {} | by distance <300 {} <600 {} <1200 {} <2400 {} more {}",
+                            cut, AlCutK(), rd[0], rd[1], rd[2], rd[3], rd[4], rd[5], di[0], di[1], di[2], di[3], di[4]);
+            {
+                const uint32_t dc = g_detail_cut.exchange(0);
+                uint32_t dr[6];
+                for (int i = 0; i < 6; ++i) dr[i] = g_det_rd[i].exchange(0);
+                static int det_lines = 0;
+                if (n && det_lines++ < 200 && (dc || dr[0] + dr[1] + dr[2] + dr[3] + dr[4] + dr[5]))
+                    REXLOG_INFO("DETAIL SIZE 10 s: cut {} (k {:.4f}) | drawn non-ground detail by radius/distance <.002 {} "
+                                "<.004 {} <.008 {} <.016 {} <.032 {} more {}", dc, det16 ? 0.016f : DetailCutK(), dr[0],
+                                dr[1], dr[2], dr[3], dr[4], dr[5]);
+            }
+            if (noprepass_on && n) {
+                using namespace al_noprepass;
+                const uint32_t mk = g_marked.exchange(0), p7 = g_p7_seen.exchange(0), p7s = g_p7_skipped.exchange(0),
+                               p8 = g_p8_seen.exchange(0), p8m = g_p8_marked.exchange(0);
+                static int np_lines = 0;
+                if (np_lines++ < 200)
+                    REXLOG_INFO("AL NOPREPASS 10 s (> {:.0f} m): marked {} | pre-pass instance renders {} skipped {} | "
+                                "colour instance renders {} of them marked {}", Dist(), mk, p7, p7s, p8, p8m);
+            }
         }
     }
     if (flat) {
@@ -1047,6 +1386,14 @@ PPC_FUNC(sub_82129550) {
         if (result) g_flat_drawn.fetch_add(1, std::memory_order_relaxed);
     }
     if (result) e.drawn_ms.store(now, std::memory_order_relaxed);
+    if (result && !al && al_hist_on && am.ok && !am.ground && am.d > 1.0f) {
+        const float q = am.r / am.d;
+        int i = 0;
+        for (float lim = 0.002f; i < 5 && q >= lim; lim *= 2.0f) ++i;
+        g_det_rd[i].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result && ((al && al_cut_on) || (!al && det_cut_on)))
+        g_cut_sticky[Hash(rec) & (kSlots - 1)].store((uint64_t(rec) << 32) | now, std::memory_order_relaxed);
     e.tested_ms.store(now, std::memory_order_relaxed);
     g_fade_tests.fetch_add(1, std::memory_order_relaxed);
     if (e.last.exchange(result, std::memory_order_relaxed) == (result ^ 1))
@@ -1299,9 +1646,13 @@ std::string ChunkName(uint8_t* base, uint32_t c) {
 //    bit 0x20 (not ready: its own slot hidden, its al drawn); ~0.1-0.3 s later
 //    0x18 -> 0x10 and the game swaps (own drawn, al hidden). From the air the
 //    swapped-in chunk's surfaces were black for ~1 s (user clip 06:04: textures
-//    not there yet). While the air view is on, the al copy stays drawn and the
-//    chunk hidden for al_swap_delay_ms (file, default 1200, 0 = off) after the
-//    chunk first becomes ready.
+//    not there yet), and hiding the detailed chunk instead left ground holes
+//    where the al copy has no ground. While the air view is on, the al copy
+//    stays drawn NEXT TO the detailed chunk (overlap: both slots on) for
+//    al_swap_delay_ms (file, default 1200, 0 = off) after the chunk first
+//    becomes ready. File "al_swap_replace" = the old replacement (detailed
+//    chunk hidden during the grace), "al_swap_delay.off" = no grace at all.
+//    "AIR COVER" log lines (1/s, capped) show the final table state.
 namespace swap_delay {
 int DelayMs() {
     static int value = 1200;
@@ -1314,6 +1665,7 @@ int DelayMs() {
             if (std::fscanf(f, "%d", &v) != 1) v = 1200;
             std::fclose(f);
         }
+        if (FileExists("al_swap_delay.off")) v = 0;
         value = std::clamp(v, 0, 10000);
     }
     return value;
@@ -1321,8 +1673,27 @@ int DelayMs() {
 uint32_t chunk_ptr[256];
 std::chrono::steady_clock::time_point ready_at[256];
 bool ready_seen[256];
+bool Replace() {
+    static bool value = false;
+    static auto next = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next) {
+        next = now + std::chrono::milliseconds(1000);
+        value = FileExists("al_swap_replace");
+    }
+    return value;
+}
+// What the last Apply did (for the AIR COVER line).
+struct Cover {
+    uint32_t chunks = 0, grace = 0, both_off = 0, own_only = 0, al_only = 0;
+    uint32_t grace_chunk = 0, off_chunk = 0;
+    int64_t grace_age_ms = -1;
+};
+Cover last_cover;
 void Apply(uint8_t* base) {
     const int delay = DelayMs();
+    const bool replace = Replace();
+    Cover cover;
     const auto now = std::chrono::steady_clock::now();
     const uint32_t count = std::min<uint32_t>(Rd32(base, 0x829A97E8), 64);
     for (uint32_t i = 0; i < count; ++i) {
@@ -1347,11 +1718,38 @@ void Apply(uint8_t* base) {
             ready_at[id] = now;
         }
         if (!ready_seen[id]) continue;
-        if (now - ready_at[id] < std::chrono::milliseconds(delay) && base[0x829ABE10 + id * 8]) {
-            base[0x829ABE10 + id * 8] = 0;  // detailed chunk: not yet
-            base[0x829ABE10 + al * 8] = 1;  // its low-detail copy stays
+        const auto age = now - ready_at[id];
+        if (age < std::chrono::milliseconds(delay) && base[0x829ABE10 + id * 8]) {
+            // The game's detailed selection stays; its low-detail copy is kept
+            // drawn too until the detailed chunk's data is there (replace =
+            // old behaviour: detailed chunk hidden meanwhile).
+            if (replace) base[0x829ABE10 + id * 8] = 0;
+            base[0x829ABE10 + al * 8] = 1;
+            ++cover.grace;
+            if (!cover.grace_chunk) {
+                cover.grace_chunk = c;
+                cover.grace_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
+            }
         }
     }
+    // Final table state of the listed chunks (after the grace above).
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t c = Rd32(base, 0x829A97E8 + 16 + i * 4);
+        if (!c) continue;
+        const uint8_t id = base[c + 8], al = base[c + 9];
+        const bool own = base[0x829ABE10 + id * 8] != 0;
+        const bool al_on = al != 255 && base[0x829ABE10 + al * 8] != 0;
+        ++cover.chunks;
+        if (!own && !al_on) {
+            ++cover.both_off;
+            if (!cover.off_chunk) cover.off_chunk = c;
+        } else if (own && !al_on) {
+            ++cover.own_only;
+        } else if (!own) {
+            ++cover.al_only;
+        }
+    }
+    last_cover = cover;
 }
 }  // namespace swap_delay
 
@@ -1468,6 +1866,28 @@ PPC_FUNC(sub_82128848) {
     }
     if (far_clip::g_air_view) {
         swap_delay::Apply(base);
+        // AIR COVER: final chunk table state for this call (1/s, max 120 lines).
+        static auto next_cover = std::chrono::steady_clock::time_point{};
+        static int cover_lines = 0;
+        const auto cnow = std::chrono::steady_clock::now();
+        if (cover_lines < 120 && cnow >= next_cover) {
+            next_cover = cnow + std::chrono::seconds(1);
+            ++cover_lines;
+            const swap_delay::Cover& cv = swap_delay::last_cover;
+            auto desc = [&](uint32_t c) {
+                if (!c) return std::string("-");
+                const uint8_t id = base[c + 8], al = base[c + 9];
+                return fmt::format("{} fl {:02X} vis {} own {} al {}", ChunkName(base, c), base[c + 20],
+                                   base[c + 228], int(base[0x829ABE10 + id * 8]),
+                                   al < 255 ? int(base[0x829ABE10 + al * 8]) : -1);
+            };
+            REXLOG_INFO("AIR COVER lr {:08X}: chunks {} grace {} (delay {} ms{}) both_off {} own_only {} al_only {} | "
+                        "grace [{} age {} ms] | off [{}] | al_no_render {} skip_al {} | main list {}/{}",
+                        lr, cv.chunks, cv.grace, swap_delay::DelayMs(), swap_delay::Replace() ? " replace" : " overlap",
+                        cv.both_off, cv.own_only, cv.al_only, desc(cv.grace_chunk), cv.grace_age_ms,
+                        desc(cv.off_chunk), int(base[0x8370D0C6]), int(base[0x8370DAEC]), Rd32(base, 0x8370D768),
+                        sr_render_list_cap());
+        }
     } else {
         ;
     }
@@ -2320,8 +2740,223 @@ void MaybeLog() {  // mutex held
     meshes.clear(); inst_pass.clear(); mesh_pass.clear(); threads.clear();
 }
 }  // namespace mesh_census
+// 24. FRAME CAPTURE (native frame renderer, milestone 1; file "framecap" next to the exe, off otherwise).
+//    Records every draw-type call the game makes during a few frames, as the inventory a native frame
+//    renderer has to reproduce: which engine path issued it (guest call chain), which pass / render
+//    target, shaders (ucode address + hash), textures (fetch constants), index / vertex buffers,
+//    constants, and the per-mesh context (8223E8D8 params / pass, 822347C0 instance / pass).
+//    Captures 3 consecutive game frames (82194BD8 ticks) at 45, 75 and 105 s after the first frame
+//    (with the Benchmark mod: in or between its runs), written to framecap_out\cap_<n>.tsv next to the exe.
+//    Hooked: 825D2478 DrawIndexed, 825D1680 / 825D1B78 / 825D2070 (other DRAW_INDX writers),
+//    825D15D0 (DRAW_INDX_2 via 825D7060), 825D7620 (DRAW_INDX_2), 825D8490 (resolve), 825E49C0 (clear?).
+namespace framecap {
+bool On() { static const bool on = FileExists("framecap"); return on; }
+std::atomic<int> active{0};
+std::atomic<uint32_t> tick{0};
+std::atomic<uint32_t> device{0};  // last device seen by 825D2478 (r3)
+// The XDK gives each recording thread its own device (2026-10-23 capture: 40001E00 and 40009480):
+// every device seen by 825D2478 is accepted.
+std::atomic<uint32_t> devices[8] = {};
+void AddDevice(uint32_t d) {
+    for (auto& x : devices) {
+        uint32_t v = x.load(std::memory_order_relaxed);
+        if (v == d) return;
+        if (!v && x.compare_exchange_strong(v, d)) return;
+        if (v == d) return;
+    }
+}
+bool IsDevice(uint32_t d) {
+    if (!d) return false;
+    for (auto& x : devices) if (x.load(std::memory_order_relaxed) == d) return true;
+    return false;
+}
+std::mutex mutex;
+std::vector<std::string> lines;
+std::atomic<uint64_t> seq{0};
+int captures = 0, ticks_left = 0;
+std::chrono::steady_clock::time_point start{};
+thread_local uint32_t depth = 0, inst = 0, inst_pass = 0xFFFFFFFFu, mesh_p = 0, mesh_pass = 0xFFFFFFFFu;
+inline uint8_t* GuestPtr(uint8_t* base, uint32_t a) { return base + a + REX_PHYS_HOST_OFFSET(a); }
+inline uint32_t G32(uint8_t* base, uint32_t a) {
+    uint32_t v;
+    std::memcpy(&v, GuestPtr(base, a), 4);
+    return __builtin_bswap32(v);
+}
+inline bool InCode(uint32_t a) { return a >= 0x820B0000u && a < 0x82799724u; }
+uint64_t Fnv(const uint8_t* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+std::unordered_map<uint64_t, uint64_t> ucode_hash;  // (addr << 32 | size) -> hash; mutex held
+uint64_t UcodeHash(uint8_t* base, uint32_t addr, uint32_t size) {
+    if (!addr || !size || size > 65536) return 0;
+    const uint64_t key = (uint64_t(addr) << 32) | size;
+    // The VS ucode is patched in place per vertex declaration (825DB738): hash every time, cache only for stats.
+    const uint64_t h = Fnv(GuestPtr(base, addr), size);
+    ucode_hash[key] = h;
+    return h;
+}
+void Record(const char* kind, PPCContext& ctx, uint8_t* base) {
+    const uint32_t dev = ctx.r3.u32;
+    const uint64_t my_seq = seq.fetch_add(1, std::memory_order_relaxed);
+    std::string s;
+    s.reserve(640);
+    // call chain: lr = return into the caller; then the back chain (each caller saved its LR at -8 of its entry sp)
+    uint32_t chain[5] = {uint32_t(ctx.lr), 0, 0, 0, 0};
+    uint32_t sp = ctx.r1.u32;
+    for (int i = 1; i < 5; ++i) {
+        const uint32_t next = G32(base, sp);
+        if (next <= sp || next - sp > 0x10000u || (next & 3)) break;
+        const uint32_t ret = G32(base, next - 8);
+        if (!InCode(ret)) break;
+        chain[i] = ret;
+        sp = next;
+    }
+    fmt::format_to(std::back_inserter(s), "{}\t{}\t{:X}\t{}\t{}\t{:08X},{:08X},{:08X},{:08X},{:08X}\t{:X}\t{:X}\t{:X}\t{:X}\t{:X}\t{:X}",
+                   kind, tick.load(std::memory_order_relaxed), GetCurrentThreadId(), depth, my_seq, chain[0], chain[1],
+                   chain[2], chain[3], chain[4], ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
+                   ctx.r9.u32);
+    fmt::format_to(std::back_inserter(s), "\tinst {:X} p{:X} mesh {:X} p{:X}", inst, inst_pass, mesh_p, mesh_pass);
+    const uint32_t known = device.load(std::memory_order_relaxed);
+    if (IsDevice(dev)) {
+        // render target / pass state from the device shadow (what the next flush sends)
+        fmt::format_to(std::back_inserter(s), "\trt {:08X} {:08X} {:08X} {:08X} cmask {:08X} zctl {:08X} mode {:08X}",
+                       Rd32(base, dev + 10240), Rd32(base, dev + 10244), Rd32(base, dev + 10248),
+                       Rd32(base, dev + 10252), Rd32(base, dev + 10332), Rd32(base, dev + 10420),
+                       Rd32(base, dev + 10452));
+        const uint32_t vs = Rd32(base, dev + 12436), ps = Rd32(base, dev + 12432);
+        uint32_t vsa = 0, vsn = 0, psa = 0, psn = 0;
+        if (vs) { vsa = Rd32(base, vs + 48); vsn = Rd32(base, vs + 600); }
+        if (ps) { psa = Rd32(base, ps + 24); psn = Rd32(base, ps + 64); }
+        fmt::format_to(std::back_inserter(s), "\tvs {:X} {:X}/{} {:016X} ps {:X} {:X}/{} {:016X}", vs, vsa, vsn,
+                       UcodeHash(base, vsa, vsn), ps, psa, psn, UcodeHash(base, psa, psn));
+        const uint32_t ib = Rd32(base, dev + 12180);
+        fmt::format_to(std::back_inserter(s), "\tib {:X} {:08X} {:08X} decl {:X}", ib, ib ? Rd32(base, ib) : 0,
+                       ib ? Rd32(base, ib + 24) : 0, Rd32(base, dev + 11552));
+        fmt::format_to(std::back_inserter(s), "\tdirty {:016X} {:016X} {:016X} {:016X} {:016X}",
+                       __builtin_bswap64(*reinterpret_cast<uint64_t*>(base + dev + 0)),
+                       __builtin_bswap64(*reinterpret_cast<uint64_t*>(base + dev + 8)),
+                       __builtin_bswap64(*reinterpret_cast<uint64_t*>(base + dev + 16)),
+                       __builtin_bswap64(*reinterpret_cast<uint64_t*>(base + dev + 24)),
+                       __builtin_bswap64(*reinterpret_cast<uint64_t*>(base + dev + 32)));
+        // fetch constants: textures (type 2) and the vertex fetches (type 3) of every slot
+        s += "\ttex";
+        for (uint32_t slot = 0; slot < 32; ++slot) {
+            const uint32_t f = dev + 1024 + slot * 24;
+            const uint32_t d0 = Rd32(base, f);
+            if ((d0 & 3) == 2)
+                fmt::format_to(std::back_inserter(s), " {}:{:08X}:{:08X}:{:08X}", slot, Rd32(base, f + 4),
+                               Rd32(base, f + 8), Rd32(base, f + 12));
+        }
+        s += "\tvf";
+        for (uint32_t i = 0; i < 96; ++i) {
+            if ((Rd32(base, dev + 1024 + (i / 3) * 24) & 3) == 2) continue;  // this slot holds a texture
+            const uint32_t f = dev + 1024 + i * 8;
+            const uint32_t d0 = Rd32(base, f);
+            if ((d0 & 3) == 3)
+                fmt::format_to(std::back_inserter(s), " {}:{:08X}:{:08X}", i, d0, Rd32(base, f + 4));
+        }
+        fmt::format_to(std::back_inserter(s), "\tc0-31 {:016X} c4 {:08X} {:08X} {:08X} {:08X}",
+                       Fnv(base + dev + 1792, 32 * 16), Rd32(base, dev + 1856), Rd32(base, dev + 1860),
+                       Rd32(base, dev + 1864), Rd32(base, dev + 1868));
+    } else {
+        fmt::format_to(std::back_inserter(s), "\tr3 {:X} (not the device {:X})", dev, known);
+    }
+    std::lock_guard lock(mutex);
+    lines.push_back(std::move(s));
+}
+// Main thread, once per game frame (82194BD8).
+void Frame() {
+    if (!On()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (start.time_since_epoch().count() == 0) start = now;
+    tick.fetch_add(1, std::memory_order_relaxed);
+    if (active.load(std::memory_order_relaxed)) {
+        if (--ticks_left > 0) return;
+        active.store(0);
+        std::vector<std::string> out;
+        uint64_t n;
+        { std::lock_guard lock(mutex); out.swap(lines); n = seq.exchange(0); }
+        std::error_code ec;
+        std::filesystem::create_directories("framecap_out", ec);
+        const std::string name = fmt::format("framecap_out/cap_{}.tsv", captures);
+        FILE* f = std::fopen(name.c_str(), "wb");
+        if (!f) { REXLOG_INFO("FRAMECAP {}: could not write {}", captures, name); return; }
+        {
+            std::fputs("kind\ttick\tthread\tdepth\tseq\tchain\tr4\tr5\tr6\tr7\tr8\tr9\tcontext\tstate...\n", f);
+            for (auto& l : out) { std::fputs(l.c_str(), f); std::fputc('\n', f); }
+            std::fclose(f);
+        }
+        REXLOG_INFO("FRAMECAP {}: {} calls in 3 game frames written to {}", captures, n, name);
+        return;
+    }
+    if (captures < 3 && now - start >= std::chrono::seconds(45 + 30 * captures)) {
+        ++captures;
+        ticks_left = 3;
+        active.store(1);
+        REXLOG_INFO("FRAMECAP {}: recording 3 game frames", captures);
+    }
+}
+struct Scope {  // nesting depth of hooked calls on this thread
+    Scope() { ++depth; }
+    ~Scope() { --depth; }
+};
+struct InstScope {
+    uint32_t old_i, old_p;
+    bool on;
+    InstScope(PPCContext& ctx) : old_i(inst), old_p(inst_pass), on(active.load(std::memory_order_relaxed) != 0) {
+        if (on) { inst = ctx.r3.u32; inst_pass = ctx.r4.u32; }
+    }
+    ~InstScope() { if (on) { inst = old_i; inst_pass = old_p; } }
+};
+struct MeshScope {
+    uint32_t old_m, old_p;
+    bool on;
+    MeshScope(PPCContext& ctx) : old_m(mesh_p), old_p(mesh_pass), on(active.load(std::memory_order_relaxed) != 0) {
+        if (on) { mesh_p = ctx.r3.u32; mesh_pass = ctx.r6.u32; }
+    }
+    ~MeshScope() { if (on) { mesh_p = old_m; mesh_pass = old_p; } }
+};
+}  // namespace framecap
+// The engine bridge (verification only, default OFF) wraps the same writers: see sub_825D2478.
+#define SR_FRAMECAP_HOOK(addr, kind, path)                                        \
+    extern "C" void __imp__sub_##addr(PPCContext& ctx, uint8_t* base);            \
+    static void sr_fc_##addr(PPCContext& ctx, uint8_t* base) {                    \
+        if (framecap::active.load(std::memory_order_relaxed)) [[unlikely]] {      \
+            framecap::Record(kind, ctx, base);                                    \
+            framecap::Scope scope;                                                \
+            __imp__sub_##addr(ctx, base);                                         \
+            return;                                                               \
+        }                                                                         \
+        __imp__sub_##addr(ctx, base);                                             \
+    }                                                                             \
+    PPC_FUNC(sub_##addr) {                                                        \
+        if (native_renderer_bridge::Enabled()) [[unlikely]] {                     \
+            native_renderer_bridge::WriterCall bridge_call(                       \
+                base, native_renderer_bridge::path,                               \
+                {ctx.r3.u32, uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, \
+                 ctx.r7.u32, ctx.r8.u32, ctx.r9.u32});                            \
+            sr_fc_##addr(ctx, base);                                              \
+            return;                                                               \
+        }                                                                         \
+        sr_fc_##addr(ctx, base);                                                  \
+    }
+SR_FRAMECAP_HOOK(825D1680, "draw_1680", kPathDrawUP)
+SR_FRAMECAP_HOOK(825D1B78, "draw_1B78", kPathDraw1B78)
+SR_FRAMECAP_HOOK(825D2070, "draw_2070", kPathDraw2070)
+SR_FRAMECAP_HOOK(825D15D0, "draw_vertices", kPathDrawVertices)
+SR_FRAMECAP_HOOK(825D7620, "draw_7620", kPathDraw7620)
+SR_FRAMECAP_HOOK(825D8490, "resolve", kPathResolve)
+SR_FRAMECAP_HOOK(825E49C0, "clear?", kPathClear)
+#undef SR_FRAMECAP_HOOK
+
 extern "C" void __imp__sub_822347C0(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_822347C0) {
+    if (al_noprepass::Skip(ctx)) return;  // LOOK11 18b: far al object, pre-pass skipped (dist air_al_noprepass)
+    al_noprepass::InstScope air_census_scope(ctx);  // LOOK11 air_draw_census (diagnostic)
+    framecap::InstScope fc_inst(ctx);
+    native_renderer_bridge::InstanceScope bridge_instance_scope(ctx.r3.u32);
     if (!mesh_census::On()) {
         if (rt_timing::Enabled()) {
             static const int idx = rt_timing::Register(0x822347C0, 0x82191328);
@@ -2342,6 +2977,9 @@ PPC_FUNC(sub_822347C0) {
 extern "C" void __imp__sub_8223E8D8(PPCContext& ctx, uint8_t* base);
 #include "native_mesh.inc"
 PPC_FUNC(sub_8223E8D8) {
+    framecap::MeshScope fc_mesh(ctx);
+    native_renderer_bridge::MeshScope bridge_mesh_scope(
+        ctx.r6.u32, native_renderer_bridge::Enabled() ? Rd32(base, ctx.r3.u32 + 24) : 0u);
     if (!mesh_census::On()) {
         if (rt_timing::Enabled()) {
             static const int idx = rt_timing::Register(0x8223E8D8, 0x822347C0);
@@ -2511,8 +3149,10 @@ SR_TL_TIMED(826370E8)
 SR_TL_TIMED(82209E30)
 SR_TL_TIMED(82189418)
 #undef SR_TL_TIMED
+#include "cpu17_probe.inc"
 extern "C" void __imp__sub_821888C0(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_821888C0) {  // render kick (section 24: waits for the render thread when overlapping)
+    cpu17_probe::Burn(0);
     render_overlap::KickWait();
     if (!timeline::On()) { __imp__sub_821888C0(ctx, base); return; }
     const uint32_t lr = uint32_t(ctx.lr);
@@ -2578,6 +3218,9 @@ void Add(uint32_t fn, uint64_t dt) {
 }  // namespace batch_ab
 bool sr_native_copy68(PPCContext& ctx, uint8_t* base);  // native_flush.inc (shadow_probe.cpp)
 bool sr_native_context(PPCContext& ctx, uint8_t* base);
+bool sr_native_settex(PPCContext& ctx, uint8_t* base);   // native_tex.inc (shadow_probe.cpp)
+bool sr_native_vsconst(PPCContext& ctx, uint8_t* base);
+bool sr_rleaf_826446F8(PPCContext& ctx, uint8_t* base);  // native_rleaf.inc (shadow_probe.cpp); false = native_rleaf off (AGENT_NATIVE23B2: was a duplicate PPC_FUNC)
 // Plain wrappers: no diagnostics, A/B or special hooks this run -> the wrapped function directly (the checks
 // below cost a few ns per call, ~60k calls per frame in heavy scenes).
 inline bool sr_rt_plain() {
@@ -2590,8 +3233,13 @@ inline bool sr_rt_plain() {
     static void sr_timed_##A(PPCContext& ctx, uint8_t* base);                              \
     PPC_FUNC(sub_##A) {                                                                    \
         if (sr_rt_plain()) [[likely]] {                                                    \
+            if (0x##A == 0x82193A20) cpu17_probe::Burn(1);                                 \
+            if (0x##A == 0x821915E8) cpu17_probe::Burn(2);                                 \
             if (0x##A == 0x82129CA0 && sr_native_copy68(ctx, base)) return;                \
             if (0x##A == 0x826306A8 && sr_native_context(ctx, base)) return;               \
+            if (0x##A == 0x8214BE00 && sr_native_settex(ctx, base)) return;                \
+            if (0x##A == 0x825D0D80 && sr_native_vsconst(ctx, base)) return;               \
+            if (0x##A == 0x826446F8 && sr_rleaf_826446F8(ctx, base)) return;               \
             __imp__sub_##A(ctx, base);                                                     \
             return;                                                                        \
         }                                                                                  \
@@ -2613,6 +3261,9 @@ inline bool sr_rt_plain() {
         static const int idx = rt_timing::Register(0x##A, 0x##P);                         \
         if (!rt_timing::Enabled()) {                                                        \
             if (0x##A == 0x82129CA0 && sr_native_copy68(ctx, base)) return;                \
+            if (0x##A == 0x8214BE00 && sr_native_settex(ctx, base)) return;                \
+            if (0x##A == 0x825D0D80 && sr_native_vsconst(ctx, base)) return;               \
+            if (0x##A == 0x826446F8 && sr_rleaf_826446F8(ctx, base)) return;               \
             if ((0x##A == 0x821938B8 || 0x##A == 0x82193A20) && batch_ab::On()) {          \
                 const uint64_t t0 = __rdtsc();                                             \
                 __imp__sub_##A(ctx, base);                                                 \
@@ -2725,8 +3376,44 @@ SR_RT_TIMED(8214BE00, 8223E8D8)
 #undef SR_RT_TIMED
 
 extern "C" void __imp__sub_825D2478(PPCContext& ctx, uint8_t* base);
+#include "native_draw.inc"
+#include "render_help.inc"  // 28. render-thread help-while-wait (AGENT_NATIVE19B, default OFF)
 static void sr_draw_body(PPCContext& ctx, uint8_t* base);
+static void sr_draw_indexed_hooked(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_825D2478) {
+    al_noprepass::OnDraw();  // LOOK11 air_draw_census (thread-local test only)
+    // M3 executor, game side (AGENT_NATIVE23B2, dist native_m3_shadow / native_m3_replace, default OFF; native_m3.inc): the
+    // writer always runs; afterwards the call's packets go to the SDK as a record v4 (shadow: reserved marker before them;
+    // replace: NOP span over them only if the SDK accepted). Off: one cached static. Bridge verification wins.
+    if (native_renderer_bridge::M3ModeCached()) [[unlikely]] {
+        native_renderer_bridge::M3Call m3c;
+        if (!native_renderer_bridge::Enabled() && native_renderer_bridge::M3Begin(base, ctx.r3.u32, uint32_t(ctx.lr), m3c)) {
+            const native_renderer_bridge::WriterArgs m3a{ctx.r3.u32, uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32,
+                                                         ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32};
+            sr_draw_indexed_hooked(ctx, base);
+            native_renderer_bridge::M3End(base, m3c, m3a);
+            return;
+        }
+    }
+    // Verification-only engine bridge (dist file native_bridge_verify, default OFF; AGENT_FRAME v2):
+    // every draw packet this call writes becomes one record keyed by its command-buffer address.
+    // Off: one relaxed atomic load. The original draw always runs.
+    if (native_renderer_bridge::Enabled()) [[unlikely]] {
+        native_renderer_bridge::WriterCall bridge_call(
+            base, native_renderer_bridge::kPathDrawIndexed,
+            {ctx.r3.u32, uint32_t(ctx.lr), ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32});
+        sr_draw_indexed_hooked(ctx, base);
+        return;
+    }
+    sr_draw_indexed_hooked(ctx, base);
+}
+static void sr_draw_indexed_hooked(PPCContext& ctx, uint8_t* base) {
+    if (framecap::active.load(std::memory_order_relaxed)) [[unlikely]] {
+        framecap::device.store(ctx.r3.u32, std::memory_order_relaxed);
+        framecap::AddDevice(ctx.r3.u32);
+        framecap::Record("draw_indexed", ctx, base);
+    }
+    framecap::Scope fc_scope;
     if (native_mesh::RecActive(ctx)) [[unlikely]] {
         native_mesh::RecBefore(ctx, base);
         sr_draw_body(ctx, base);
@@ -2747,6 +3434,7 @@ static void sr_draw_body(PPCContext& ctx, uint8_t* base) {
                 rt_timing::Add(idx, __rdtsc() - t0);
                 return;
             }
+            if (native_draw::Run(ctx, base)) return;
             __imp__sub_825D2478(ctx, base); return;
         }
         const bool inside = mesh_census::in_mesh > 0;
@@ -2857,11 +3545,15 @@ bool grown = false;
 extern "C" void __imp__sub_82194B78(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_82194B78) {
     __imp__sub_82194B78(ctx, base);
+    if (al_noprepass::On() || al_noprepass::CensusOn()) al_noprepass::OnAlloc(ctx.r3.u32);  // LOOK11 18b
     render_pool::allocs.fetch_add(1, std::memory_order_relaxed);
     if (!ctx.r3.u32) render_pool::fails.fetch_add(1, std::memory_order_relaxed);
 }
+void sr_pop_census_frame(uint8_t* base);  // shadow_probe.cpp (AGENT_NATIVE26B, opt-in pop_census)
 extern "C" void __imp__sub_82194BD8(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_82194BD8) {
+    if (al_noprepass::CensusOn()) al_noprepass::CensusLog();  // LOOK11
+    if (al_noprepass::FarAll()) al_noprepass::FarLog();       // NATIVE24B prepass_far
     using namespace render_pool;
     const uint32_t used_before = Rd32(base, kPool + 40);
     {
@@ -2887,9 +3579,12 @@ PPC_FUNC(sub_82194BD8) {
     }
     const uint32_t size_before = Rd32(base, kPool + 56);
     __imp__sub_82194BD8(ctx, base);  // used = 0
+    native_renderer_bridge::FrameBoundary();
+    framecap::Frame();
     mesh_census::frames.fetch_add(1, std::memory_order_relaxed);
     native_mesh::AbTick();
     colour_split::Frame();
+    sr_pop_census_frame(base);
     if (rt_timing::Enabled()) { rt_timing::frames.fetch_add(1, std::memory_order_relaxed); rt_timing::MaybeLog(); }
     if (mesh_census::On()) timeline::Frame();
     batch_ab::Frame(base);

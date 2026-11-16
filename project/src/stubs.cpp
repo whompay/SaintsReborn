@@ -5,12 +5,14 @@
 // remains callable as __imp__sub_X. PPC_FUNC_IMPL(__imp__Name) replaces the
 // SDK's implementation of a kernel import.
 
+#include "native_renderer_bridge.h"
 #include "saintsrow_config.h"
 #include "saintsrow_init.h"
 #include "fps_overlay.h"
 #include "perf_monitor.h"
 #include "wml/mod_loader.h"
 #include "world_studio_bridge.h"
+#include "photo_mode.h"
 
 #include <rex/graphics/graphics_system.h>
 #include <rex/ppc/function.h>
@@ -19,6 +21,7 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xsemaphore.h>
 
+#include <intrin.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -198,11 +201,18 @@ PPC_FUNC(sub_825E54A8) {
                     }
                 }).detach();
             });
-            const bool was_requested = copycheck->requested.exchange(background, std::memory_order_relaxed);
-            if (was_requested != background) {
-                // Never apply a cached result from an earlier background stint
-                // while the fresh transition-triggered scan is in progress.
-                copycheck->other_copy.store(false, std::memory_order_relaxed);
+            if (copycheck->requested.load(std::memory_order_relaxed) != background) {
+                // Focus changed (rare). Publish the request under the mutex so the
+                // worker cannot check the predicate, miss this store and then block
+                // (lost wake-up -> no scan for the whole background stint)
+                // (AGENT_GAME_FIX 2026-10-23).
+                {
+                    std::lock_guard<std::mutex> lock(copycheck->mutex);
+                    copycheck->requested.store(background, std::memory_order_relaxed);
+                    // Never apply a cached result from an earlier background stint
+                    // while the fresh transition-triggered scan is in progress.
+                    copycheck->other_copy.store(false, std::memory_order_relaxed);
+                }
                 copycheck->cv.notify_one();
             }
             other_copy = background && copycheck->other_copy.load(std::memory_order_relaxed);
@@ -227,6 +237,7 @@ PPC_FUNC(sub_825E54A8) {
     sr::PerfFrameBegin();
     wml::OnFrame();
     sr::world_studio::OnPresent(ctx, base);
+    sr::photo::OnPresent(base);
     __imp__sub_825E54A8(ctx, base);
     // Command buffers run on the GPU thread while the game carries on; keep
     // at most one frame of them queued.
@@ -234,9 +245,110 @@ PPC_FUNC(sub_825E54A8) {
     sr::PerfFrameEnd();
 }
 
+// Job joins (2026-10-26): 826370E8 waits for a job's completion event with WaitForSingleObjectEx(event, INFINITE)
+// (return address 82637174); the render thread does this several times per frame (list prep 821938B8, colour pass
+// 821929C8) and the main thread ~5 times. Arriving early means sleeping on the event and paying the wake-up latency;
+// a 300 us busy spin on the render thread before 82193A20 made the air benchmark ~5 % FASTER. Spin-then-block:
+// poll the same object with a zero timeout for up to N us, then the normal wait. A poll that succeeds has exactly the
+// effect of the real wait (the event is consumed the same way). Files spin_wait_<N> (N = 25 50 100 200 400),
+// spin_wait.off wins. Only this one call site; the workers' idle waits are untouched.
+namespace spin_wait {
+uint32_t Us() {
+    static const uint32_t us = [] {
+        if (FILE* f = std::fopen("spin_wait.off", "rb")) { std::fclose(f); return 0u; }
+        uint32_t v = 0;
+        for (uint32_t n : {25u, 50u, 100u, 200u, 400u}) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "spin_wait_%u", n);
+            if (FILE* f = std::fopen(name, "rb")) { std::fclose(f); v = n; }
+        }
+        REXLOG_INFO("Job join spin-then-block (826370E8): {} us", v);
+        return v;
+    }();
+    return us;
+}
+std::atomic<uint64_t> polls_won[3]{}, polls_lost[3]{};
+void CountSpin(int site, bool won) {
+    const uint64_t w = won ? polls_won[site].fetch_add(1, std::memory_order_relaxed) + 1
+                           : polls_won[site].load(std::memory_order_relaxed);
+    const uint64_t l = won ? polls_lost[site].load(std::memory_order_relaxed)
+                           : polls_lost[site].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (((w + l) & 0xFFFFu) == 0)
+        REXLOG_INFO("SPIN WAIT {}: signalled during the spin {} / blocked after it {}", site == 2 ? "frame kick" : site ? "worker" : "join", w, l);
+}
+// true = the object was signalled during the spin (ctx holds the wait's result).
+bool Spin(PPCContext& ctx, uint8_t* base, uint32_t us, int site = 0) {
+    const uint64_t handle = ctx.r3.u64, timeout = ctx.r4.u64, alertable = ctx.r5.u64, lr = ctx.lr;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    for (;;) {
+        ctx.r3.u64 = handle;
+        ctx.r4.u64 = 0;
+        ctx.r5.u64 = alertable;
+        ctx.lr = lr;
+        __imp__sub_8271C2E8(ctx, base);
+        if (ctx.r3.u32 != 0x102u) {  // not STATUS_TIMEOUT: signalled (or alerted / failed, as the real wait would report)
+            CountSpin(site, true);
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= end) break;
+        for (int i = 0; i < 32; ++i) _mm_pause();
+    }
+    CountSpin(site, false);
+    ctx.r3.u64 = handle;
+    ctx.r4.u64 = timeout;
+    ctx.r5.u64 = alertable;
+    ctx.lr = lr;
+    return false;
+}
+// Worker idle wait (2026-10-26): the job workers (826368E0) block on their queue object with return address
+// 82636958 after every job. The main and render threads post several jobs per frame and then join them, so each
+// job start pays a worker wake-up. Files worker_spin_<N> (N = 25 50 100 200 400): poll the queue object for up
+// to N us after a job before the normal blocking wait (same zero-timeout poll as above). worker_spin.off wins.
+uint32_t WorkerUs() {
+    static const uint32_t us = [] {
+        if (FILE* f = std::fopen("worker_spin.off", "rb")) { std::fclose(f); return 0u; }
+        uint32_t v = 0;
+        for (uint32_t n : {25u, 50u, 100u, 200u, 400u}) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "worker_spin_%u", n);
+            if (FILE* f = std::fopen(name, "rb")) { std::fclose(f); v = n; }
+        }
+        REXLOG_INFO("Job worker spin-then-block (826368E0): {} us", v);
+        return v;
+    }();
+    return us;
+}
+// Frame kick (2026-10-26): once per frame the main thread hands work over in 82189418 and blocks on an event
+// (return address 821894DC, 0.2-0.4 ms/frame). Files kick_spin_<N> (N = 25 50 100 200 400), kick_spin.off wins.
+// DEFAULT 100 us since session 19 (AGENT_NATIVE19B, c19k A/B); dist file kick_spin.off = old blocking wait.
+uint32_t KickUs() {
+    static const uint32_t us = [] {
+        if (FILE* f = std::fopen("kick_spin.off", "rb")) { std::fclose(f); return 0u; }
+        uint32_t v = 100;
+        for (uint32_t n : {25u, 50u, 100u, 200u, 400u}) {
+            char name[32];
+            std::snprintf(name, sizeof(name), "kick_spin_%u", n);
+            if (FILE* f = std::fopen(name, "rb")) { std::fclose(f); v = n; }
+        }
+        REXLOG_INFO("Frame kick spin-then-block (82189418): {} us", v);
+        return v;
+    }();
+    return us;
+}
+}  // namespace spin_wait
+
 // WaitForSingleObjectEx (guest wrapper): timed for the performance log.
 extern "C" void __imp__sub_8271C2E8(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_8271C2E8) {
+    if (spin_wait::Us() && uint32_t(ctx.lr) == 0x82637174u) [[unlikely]] {
+        if (spin_wait::Spin(ctx, base, spin_wait::Us())) return;
+    }
+    if (spin_wait::WorkerUs() && uint32_t(ctx.lr) == 0x82636958u) [[unlikely]] {
+        if (spin_wait::Spin(ctx, base, spin_wait::WorkerUs(), 1)) return;
+    }
+    if (spin_wait::KickUs() && uint32_t(ctx.lr) == 0x821894DCu) [[unlikely]] {
+        if (spin_wait::Spin(ctx, base, spin_wait::KickUs(), 2)) return;
+    }
     if (!sr::PerfWaitsOn()) {
         __imp__sub_8271C2E8(ctx, base);
         return;
@@ -358,6 +470,7 @@ PPC_FUNC(sub_82185498) {
     // after world simulation, so transforms written by mods were overwritten before the
     // next visible frame.
     if (!sr::world_studio::BeforeGameFrame(base)) return;
+    sr::photo::BeforeGameFrame(base);
     wml::OnGameFrame();
     __imp__sub_82185498(ctx, base);
 }
@@ -520,14 +633,25 @@ static std::atomic<uint32_t> g_submitted_ibs{0};
 // execute it on the command processor. r4 points to {dword count, GPU address}.
 PPC_FUNC(sub_825D3218) {
     sr::PerfCount(sr::kPerfCommandBuffers);
+    ++native_renderer_bridge::t_m3_kicks;  // M3 (AGENT_NATIVE23B2): a kick inside a writer call disqualifies it
+    // Verification-only frame bridge (dist file native_bridge_verify, default OFF): records for the draws
+    // written outside the hooked writers. Off: one relaxed atomic load.
     const uint32_t desc = ctx.r4.u32;
     const uint32_t dwords = GRd32(base, desc + 0);
     const uint32_t gpu_addr = GRd32(base, desc + 4);
+    const bool bridge = native_renderer_bridge::Enabled();
+    // native_frame_meta alone: no kick walk, no lock (OnKick only counts the kick for the writers).
+    const bool bridge_lock = bridge && native_renderer_bridge::KickLock();
+    if (bridge) [[unlikely]] {
+        if (bridge_lock) native_renderer_bridge::LockSubmit();  // walk + submit in one order (verification only)
+        native_renderer_bridge::OnKick(base, ctx.r3.u32, gpu_addr, dwords);
+    }
     auto* ks = REX_KERNEL_STATE();
     if (dwords && dwords < 0x400000u) {
         const uint8_t* host = ks->memory()->TranslatePhysical(gpu_addr & 0x1FFFFFFFu);
         ks->emulator()->graphics_system()->SubmitCommandStream(host, dwords * 4u);
     }
+    if (bridge_lock) [[unlikely]] native_renderer_bridge::UnlockSubmit();
     g_submitted_ibs.fetch_add(1);
 }
 
@@ -553,8 +677,16 @@ PPC_FUNC(sub_825DF0B8) {
     for (uint32_t w = wptr_before; w != wptr_after && n < 16; w = (w + 1) & mask) {
         words[n++] = __builtin_bswap32(GRd32(base, ring + (w << 2)));  // keep guest (BE) layout
     }
+    const bool bridge_on = native_renderer_bridge::Enabled();
+    const bool bridge = bridge_on && native_renderer_bridge::KickLock();
+    if (bridge) [[unlikely]] {
+        native_renderer_bridge::LockSubmit();
+        native_renderer_bridge::OnTileSelect(words, n);
+    }
+    if (bridge_on) [[unlikely]] native_renderer_bridge::OnTileSubmit();  // right before the submission
     REX_KERNEL_STATE()->emulator()->graphics_system()->SubmitCommandStream(
         reinterpret_cast<const uint8_t*>(words), n * 4u);
+    if (bridge) [[unlikely]] native_renderer_bridge::UnlockSubmit();
 }
 
 // End of a predicated-tiling pass: builds and queues the per-tile replay.

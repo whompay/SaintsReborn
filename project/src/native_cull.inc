@@ -18,8 +18,8 @@ inline void Wr(u8* b, u32 a, u32 v) { v = __builtin_bswap32(v); std::memcpy(G(b,
 inline double R(double x) { return double(float(x)); }
 int Mode() {
     static const int m = [] {
-        // Default OFF until verified + A/B'd (round 5b): dist\native_cull = on, native_cull_verify = verify, native_cull_off wins.
-        int r = 0;
+        // dist\native_cull_verify = verify, native_cull_off = off.
+        int r = 1;  // default ON (verify 0 differ; c19h A/B 4/4 pairs, +3.7 %)
         if (FILE* f = std::fopen("native_cull_off", "rb")) { std::fclose(f); r = 0; }
         else if (FILE* f2 = std::fopen("native_cull_verify", "rb")) { std::fclose(f2); r = 2; }
         else if (FILE* f3 = std::fopen("native_cull", "rb")) { std::fclose(f3); r = 1; }
