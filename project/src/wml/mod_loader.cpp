@@ -260,7 +260,16 @@ void ApiOverlayBeams(const float* data, int count) {
 // Picture look (set_look): the GPU backend applies it at swap time
 // (RexLookSettings); anisotropic filtering is the texture cache's override.
 typedef void (*RexLookSettingsFunction)(const float* data, int count);
+// The last look a mod set (photo mode starts from it and goes back to it).
+std::mutex g_last_look_mutex;
+std::vector<float> g_last_look;
 void ApiSetLook(const float* data, int count) {
+  {
+    std::lock_guard<std::mutex> lock(g_last_look_mutex);
+    if (data && count >= 13) g_last_look.assign(data, data + std::min(count, 14));
+    else g_last_look.clear();
+    while (!g_last_look.empty() && g_last_look.size() < 14) g_last_look.push_back(0.0f);
+  }
   static RexLookSettingsFunction fn = nullptr;
   if (!fn) {
     HMODULE gpu = GetModuleHandleW(L"rexgpu-xenos.dll");
@@ -343,6 +352,12 @@ void StartNativeMod(const ModInfo& mod) {
 }  // namespace
 
 void SetLook(const float* data, int count) { ApiSetLook(data, count); }
+bool LastLook(float* out14) {
+  std::lock_guard<std::mutex> lock(g_last_look_mutex);
+  if (g_last_look.size() < 14) return false;
+  std::copy(g_last_look.begin(), g_last_look.begin() + 14, out14);
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Internals shared with lua_mods.cpp

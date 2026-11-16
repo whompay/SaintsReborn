@@ -24,7 +24,7 @@ inline u32 Bits(double d) { const float f = float(d); u32 v; std::memcpy(&v, &f,
 inline double R(double x) { return double(float(x)); }
 int Mode() {
     static const int m = [] {
-        int r = 0;
+        int r = 1;  // default ON (verify 0 differ; c19h A/B 4/4 pairs, +3.7 %)
         if (FILE* f = std::fopen("native_geom_off", "rb")) { std::fclose(f); r = 0; }
         else if (FILE* f2 = std::fopen("native_geom_verify", "rb")) { std::fclose(f2); r = 2; }
         else if (FILE* f3 = std::fopen("native_geom", "rb")) { std::fclose(f3); r = 1; }

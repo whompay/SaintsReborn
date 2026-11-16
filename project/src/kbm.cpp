@@ -49,6 +49,7 @@
 #include "options_menu.h"
 #include "coop_menu.h"
 #include "world_studio_bridge.h"
+#include "photo_mode.h"
 #include "wml/mod_loader.h"
 
 #include <algorithm>
@@ -562,6 +563,20 @@ PPC_FUNC_IMPL(__imp__XamInputGetState) {
     state->gamepad = {};
     return;
   }
+  if (sr::photo::Active()) {
+    // Photo mode (photo_mode.cpp) has the pad, mouse and wheel; the game gets nothing
+    // (not even the co-op menu's Start pulse).
+    double dx = 0, dy = 0;
+    PollMouseLocked(dx, dy);
+    const int wheel = g_mouse.wheel_y;
+    g_mouse.wheel_y = 0;
+    g_mouse.dx = g_mouse.dy = 0;
+    const auto& p = state->gamepad;
+    sr::photo::Input(uint16_t(p.buttons), uint8_t(p.left_trigger), uint8_t(p.right_trigger), int16_t(p.thumb_lx),
+                     int16_t(p.thumb_ly), int16_t(p.thumb_rx), int16_t(p.thumb_ry), dx, dy, wheel);
+    state->gamepad = {};
+    return;
+  }
   if (sr::CoopResumePulse()) {
     state->gamepad = {};
     state->gamepad.buttons = X_INPUT_GAMEPAD_START;
@@ -838,6 +853,11 @@ PPC_FUNC(sub_8210D518) {
   // camera back every frame (the view flickered between both cameras).
   if (sr::world_studio::OwnsCamera()) {
     sr::world_studio::WriteEditorCamera(base);
+    return;
+  }
+  // Photo mode: its own camera, no game camera update (same flicker).
+  if (sr::photo::Active()) {
+    sr::photo::AfterCamera(base);
     return;
   }
   constexpr uint32_t kCamera = 0x827D9778;
