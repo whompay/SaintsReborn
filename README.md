@@ -136,6 +136,21 @@ Options, set by creating a file next to `saintsrow.exe`:
 | `gpu_timing` | An empty file with this name logs the GPU time per frame by kind of work (draws, render target copies, texture loads, resolves, uploads) every 2 seconds. |
 | `replay_thread.off`, `upload_batching.off`, `upload_check.off`, `bg_verify.off`, `direct_resolve_off`, `direct_resolve_skip_memory.off`, `rt_fast.off`, `texture_lookup_cache.off`, `keep_cross_transfers`, `msaa_tiling` | Troubleshooting: each empty file turns one performance optimization off. Only useful when looking for the cause of a graphics problem. |
 
+Press **F5** in game to open the display settings menu. It lists every
+resolution your monitor supports and offers:
+
+| Setting | Effect |
+|---|---|
+| Window mode | `Windowed`, `Borderless Fullscreen` (desktop resolution) or `Fullscreen` (changes the monitor's display mode). |
+| Resolution | Window size in windowed mode, display mode in fullscreen. |
+| Widescreen | `Keep aspect (black bars)`, `Fill screen (crop edges)` (zooms in, crops top/bottom, no distortion) or `Stretch to fill (distorts)`. Applies immediately. |
+| Aspect ratio | `Auto (game)`, `4:3`, `16:9`, `16:10` or `21:9` — the shape the image is presented at. Combined with `Keep aspect` you get bars around the chosen ratio; with `Fill screen` it zooms to cover. Has no effect in `Stretch` mode. |
+| Internal resolution | Render scale `1x` (720p) to `4x` (2880p). Applies after a restart. `res_scale.txt` overrides it if present. |
+
+**Apply** switches immediately and asks you to confirm within 30 seconds,
+otherwise it reverts. Settings are saved to `saintsrow.toml` next to
+the exe. F11 toggles fullscreen.
+
 ## Mods
 
 Saints Reborn comes with **Whompay's Mod Loader**. Run
