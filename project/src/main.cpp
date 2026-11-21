@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include "photo_mode.h"
 #include "world_studio_bridge.h"
 #include "online_integrity.h"
 #include "discord_presence.h"
@@ -875,6 +876,12 @@ public:
             // Text from native mods is drawn by the same overlay.
             wml::SetOverlayTextListener([this](bool shown) {
                 app_context().CallInUIThread([this, shown]() { fps_overlay_.SetModTextVisible(shown); });
+            });
+            // Photo mode's panel is drawn in the mod text window: up while photo mode is on.
+            sr::photo::SetPanelListener([this](bool on) {
+                app_context().CallInUIThread([this, on]() {
+                    fps_overlay_.SetModTextVisible(on || !wml::OverlayText().empty());
+                });
             });
             wml::SetOverlayBeamsListener([this](bool shown) {
                 app_context().CallInUIThread([this, shown]() { fps_overlay_.SetBeamsVisible(shown); });

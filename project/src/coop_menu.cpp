@@ -20,6 +20,7 @@
 
 #include "coop_menu.h"
 #include "online_players.h"
+#include "photo_mode.h"
 
 #include <sr_reserved_names.h>
 
@@ -57,9 +58,11 @@ constexpr uint32_t kActiveScreen = 0x839E0DF8u;
 enum Action { kHost, kJoin, kStop, kName, kZombies };
 // 0-3: rows of the pause menu's CO-OP tab (mixed case like the game's own
 // rows), 4: the tab's name, 5: the main menu row (upper case like its rows).
-const char* const kLabels[] = {"Host Co-op", "Join Co-op", "End Co-op", "Leave Co-op", "CO-OP", "JOIN CO-OP"};
-constexpr int kLabelCount = 6;
-constexpr int kTabLabel = 4, kMainLabel = 5;
+const char* const kLabels[] = {"Host Co-op", "Join Co-op", "End Co-op", "Leave Co-op", "CO-OP", "JOIN CO-OP", "Photo Mode"};
+constexpr int kLabelCount = 7;
+constexpr int kTabLabel = 4, kMainLabel = 5, kPhotoLabel = 6;
+// Story pause menu > OPTIONS: "Photo Mode" after Quit Game (photo_mode.cpp). Its list row, -1 = none.
+int g_photo_row = -1;
 
 // Pause menu CO-OP tab. The pause menu builder sub_822BFA88 adds its tabs
 // with sub_822903E8(r3 = name, r4 = selected, r5 = menu id): MAP 26, INFO 32,
@@ -145,7 +148,7 @@ enum class DialogFor { kNone, kPause, kMainMenu, kName, kFriend } g_dialog_for =
 // (hosting online right away with the pause menu up crashed): the pause
 // menu is closed with a short Start press (sent by kbm.cpp), then the action
 // runs when no menu is open (or after 4 s regardless).
-int g_resume_action = 0;  // 1 host, 2 join
+int g_resume_action = 0;  // 1 host, 2 join, 3 photo mode (it starts itself once the menu is gone)
 std::string g_resume_code;
 std::chrono::steady_clock::time_point g_resume_since{};
 bool g_resume_clock = false;
@@ -601,6 +604,19 @@ void Select(PPCContext& ctx, uint8_t* base, uint32_t row) {
 PPC_FUNC(sub_8228CAD8) {
   const uint32_t lr = uint32_t(ctx.lr);
   ApplyMinPlayers(base);  // every menu list build (matchmaking starts from menus)
+  if (lr == kPauseOptionsDone) {
+    // Story pause menu > OPTIONS: "Photo Mode" after Quit Game (greyed during a co-op session:
+    // stopping time for one player would split the session).
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    g_photo_row = -1;
+    const uint32_t menu = R32(base, kMenuPointer);
+    if (menu && Host(base, kMultiplayerFlag)[0] == 0 && EnsureTexts(base)) {
+      g_photo_row = int(R16(base, menu + 58));
+      AddRow(ctx, base, g_text[kPhotoLabel], (CoopState() & 3) == 0);
+    }
+    __imp__sub_8228CAD8(ctx, base);
+    return;
+  }
   if (lr == kMpOptionsDone && sr::PlayersBuilding(base)) {
     // MULTIPLAYER > PLAYERS (online_players.cpp) uses the OPTIONS build.
     sr::PlayersFillList(ctx, base);
@@ -839,6 +855,25 @@ PPC_FUNC(sub_822B7D68) {
   if (current == kCoopId && CoopLoaded()) {
     UpdateCoopTab(ctx, base);
     return;
+  }
+  if (current == kOptionsId && g_photo_row >= 0 && Host(base, kMultiplayerFlag)[0] == 0 && !g_dialog_open.load()) {
+    // A on "Photo Mode" (the game's own A handler ignores rows past Quit Game): close the pause
+    // menu (kbm.cpp sends a short Start press) and photo mode starts once it is gone.
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    const uint32_t menu = R32(base, kMenuPointer);
+    if (menu && int(R16(base, menu + 62)) == g_photo_row && g_photo_row < int(R16(base, menu + 58)) &&
+        Host(base, menu + 64 + uint32_t(g_photo_row))[0] && ConfirmPressed(ctx, base)) {
+      {
+        rex::CallFrame frame(ctx);
+        frame.ctx.r3.u64 = R32(base, 0x827B05B8u);  // the menu's select sound
+        frame.ctx.r4.u64 = 1;
+        frame.ctx.r5.u64 = 1;
+        __imp__sub_82287FC0(frame.ctx, base);
+      }
+      REXLOG_INFO("Pause menu: Photo Mode");
+      sr::photo::RequestStart();
+      StartAfterResume(3, {});
+    }
   }
   __imp__sub_822B7D68(ctx, base);
 }
@@ -1577,9 +1612,11 @@ void sr::CoopMenuPoll(uint8_t* base) {
     const bool menu_open = R32(base, kActiveScreen) != 0;
     if ((!menu_open && ms >= 400) || ms >= 4000) {
       REXLOG_INFO("Co-op menu: {} ({} ms after leaving the menu, menu {})",
-                  g_resume_action == 1 ? "hosting" : "joining", ms, menu_open ? "still open" : "closed");
+                  g_resume_action == 1 ? "hosting" : g_resume_action == 2 ? "joining" : "photo mode", ms,
+                  menu_open ? "still open" : "closed");
       if (g_resume_action == 1) CoopHost();
-      else CoopJoin(g_resume_code);
+      else if (g_resume_action == 2) CoopJoin(g_resume_code);
+      else if (g_resume_action == 3) sr::photo::MenuGone();
       g_resume_action = 0;
     }
   }

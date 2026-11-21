@@ -1,6 +1,7 @@
 // On-screen frame rate counter (F1): plain text in the top-left corner.
 
 #include "fps_overlay.h"
+#include "photo_mode.h"
 #include "chat.h"
 #include "wml/mod_loader.h"
 #include "world_studio_bridge.h"
@@ -31,8 +32,18 @@ std::atomic<uint64_t> g_game_frames{0};
 namespace {
 
 ImFont* g_font = nullptr;
+ImFont* g_font_hud = nullptr;  // Photo mode panel title: a heavy condensed face (Impact / Bahnschrift)
 
 void SetupFont(ImFontAtlas* atlas) {
+  {
+    std::error_code ec;
+    for (const char* path : {"C:\\Windows\\Fonts\\impact.ttf", "C:\\Windows\\Fonts\\bahnschrift.ttf"}) {
+      if (std::filesystem::exists(path, ec)) {
+        g_font_hud = atlas->AddFontFromFileTTF(path, 64.0f);
+        if (g_font_hud) break;
+      }
+    }
+  }
   // A bold system font if there is one; ImGui's built-in font otherwise.
   const char* candidates[] = {
       "C:\\Windows\\Fonts\\segoeuib.ttf",
@@ -56,6 +67,7 @@ class FpsDialog : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
+    if (sr::photo::Active()) return;  // photo mode: nothing but its own panel
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - last_time_).count();
     if (elapsed >= 0.5) {
@@ -281,6 +293,80 @@ void DrawOnlineNotice(ImGuiIO& io) {
                     col(150, 70, 205, 255));
 }
 
+// Photo mode (photo_mode.cpp): a dark panel on the left - title, the rows (value and a slider
+// bar, the chosen row in the game's yellow), the controls at the bottom; a white flash when a
+// photo is taken, notices at the bottom. None of it is in the saved photo (captured before overlays).
+void DrawPhotoMode(ImGuiIO& io, const sr::photo::Panel& ph) {
+  const float W = io.DisplaySize.x, H = io.DisplaySize.y;
+  const float s = std::max(0.75f, H / 1080.0f);
+  ImFont* font = g_font ? g_font : ImGui::GetFont();
+  ImFont* big = g_font_hud ? g_font_hud : font;
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  if (ph.flash > 0.0f) dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(255, 255, 255, int(170 * ph.flash)));
+  if (ph.show) {
+    const float pad = 20 * s, row_h = 38 * s, size = 24 * s, sm = 18 * s, title = 44 * s;
+    const float w = 470 * s;
+    const char* help1 = ph.keyboard ? "WASD move   Mouse look   Q / E down / up   Shift fast   Ctrl slow"
+                                    : "LS move   RS look   LT / RT down / up   LS click fast";
+    const char* help2 = ph.keyboard ? "Arrows choose / change   Enter photo   H hide   R reset   Esc exit"
+                                    : "D-pad choose / change   A photo   Y hide   B exit";
+    const float h = pad * 2 + title * 1.15f + row_h * float(ph.rows.size()) + sm * 3.4f;
+    const ImVec2 p0(40 * s, std::max(20 * s, (H - h) * 0.5f)), p1(p0.x + w, p0.y + h);
+    dl->AddRectFilled(p0, p1, IM_COL32(12, 8, 18, 215), 8 * s);
+    dl->AddRect(p0, p1, IM_COL32(150, 90, 200, 230), 8 * s, 0, 2 * s);
+    float y = p0.y + pad;
+    dl->AddText(big, title, ImVec2(p0.x + pad + 2 * s, y + 2 * s), IM_COL32(0, 0, 0, 200), "PHOTO MODE");
+    dl->AddText(big, title, ImVec2(p0.x + pad, y), IM_COL32(255, 210, 60, 255), "PHOTO MODE");
+    y += title * 1.15f;
+    const float bar_w = 120 * s, bar_h = 6 * s;
+    for (size_t i = 0; i < ph.rows.size(); ++i) {
+      const auto& r = ph.rows[i];
+      const bool on = int(i) == ph.selected;
+      if (on) dl->AddRectFilled(ImVec2(p0.x + pad * 0.5f, y), ImVec2(p1.x - pad * 0.5f, y + row_h * 0.92f), IM_COL32(230, 180, 40, 255), 4 * s);
+      const ImU32 text = on ? IM_COL32(15, 10, 5, 255) : IM_COL32(240, 240, 240, 255);
+      const ImU32 dim = on ? IM_COL32(60, 40, 10, 255) : IM_COL32(170, 170, 180, 255);
+      const float ty = y + (row_h * 0.92f - size) * 0.5f;
+      if (r.action) {
+        const ImVec2 e = font->CalcTextSizeA(size, FLT_MAX, 0, r.name.c_str());
+        dl->AddText(font, size, ImVec2(p0.x + (w - e.x) * 0.5f, ty), text, r.name.c_str());
+      } else {
+        dl->AddText(font, size, ImVec2(p0.x + pad, ty), text, r.name.c_str());
+        const ImVec2 e = font->CalcTextSizeA(size, FLT_MAX, 0, r.value.c_str());
+        const float vx = p1.x - pad - e.x;
+        dl->AddText(font, size, ImVec2(vx, ty), text, r.value.c_str());
+        if (r.fill >= 0.0f) {
+          const float bx1 = p1.x - pad - 95 * s, bx0 = bx1 - bar_w, by = y + row_h * 0.46f - bar_h * 0.5f;
+          dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx1, by + bar_h), on ? IM_COL32(120, 80, 10, 255) : IM_COL32(70, 60, 85, 255), bar_h);
+          const float f = std::clamp(r.fill, 0.0f, 1.0f);
+          dl->AddRectFilled(ImVec2(bx0, by), ImVec2(bx0 + bar_w * f, by + bar_h), on ? IM_COL32(20, 12, 4, 255) : IM_COL32(205, 160, 255, 255), bar_h);
+          dl->AddCircleFilled(ImVec2(bx0 + bar_w * f, by + bar_h * 0.5f), bar_h * 1.1f, on ? IM_COL32(20, 12, 4, 255) : IM_COL32(255, 255, 255, 255), 12);
+        } else if (!r.value.empty()) {
+          // a choice (Filter): arrows round the value
+          dl->AddText(font, size, ImVec2(vx - 22 * s, ty), dim, "<");
+          dl->AddText(font, size, ImVec2(p1.x - pad + 4 * s, ty), dim, ">");
+        }
+      }
+      y += row_h;
+    }
+    y += sm * 0.6f;
+    dl->AddText(font, sm, ImVec2(p0.x + pad, y), IM_COL32(190, 190, 200, 255), help1);
+    dl->AddText(font, sm, ImVec2(p0.x + pad, y + sm * 1.3f), IM_COL32(190, 190, 200, 255), help2);
+  } else {
+    const char* t = ph.keyboard ? "H: show panel" : "Y: show panel";
+    const float sz = 18 * s;
+    const ImVec2 e = font->CalcTextSizeA(sz, FLT_MAX, 0, t);
+    dl->AddText(font, sz, ImVec2(W - e.x - 24 * s, H - sz - 20 * s), IM_COL32(255, 255, 255, 110), t);
+  }
+  if (!ph.notice.empty() && ph.notice_alpha > 0) {
+    const float sz = 26 * s;
+    const ImVec2 e = font->CalcTextSizeA(sz, FLT_MAX, 0, ph.notice.c_str());
+    const ImVec2 p(W * 0.5f - e.x * 0.5f, H * 0.88f);
+    const int a = int(255 * std::clamp(ph.notice_alpha, 0.0f, 1.0f));
+    dl->AddRectFilled(ImVec2(p.x - 18 * s, p.y - 8 * s), ImVec2(p.x + e.x + 18 * s, p.y + sz + 8 * s), IM_COL32(12, 8, 18, a * 200 / 255), 6 * s);
+    dl->AddText(font, sz, p, IM_COL32(255, 255, 255, a), ph.notice.c_str());
+  }
+}
+
 // Text native mods show over the game (WML overlay_text), always drawn.
 class ModTextDialog : public rex::ui::ImGuiDialog {
  public:
@@ -288,6 +374,13 @@ class ModTextDialog : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
+    {
+      sr::photo::Panel ph;
+      if (sr::photo::GetPanel(ph)) {
+        DrawPhotoMode(io, ph);
+        return;
+      }
+    }
     DrawChat(io);
     DrawPicker(io);
     DrawOnlineNotice(io);
@@ -467,6 +560,8 @@ void FpsOverlay::ShowNotice(int cap) {
 // presenter is connected to the window, never gets drawn.
 void FpsOverlay::SetModTextVisible(bool visible) {
   if (!impl_) return;
+  // Photo mode draws its panel in this window: it stays while photo mode is on.
+  if (!visible && sr::photo::Active()) return;
   if (visible && !impl_->mod_text) {
     impl_->mod_text = std::make_unique<ModTextDialog>(impl_->imgui_drawer.get());
   } else if (!visible) {
