@@ -1,0 +1,63 @@
+name: Linux setup
+
+# The Linux setup (Saints-Reborn-Linux-Setup.run): the setup core as the Linux setup builds it
+# (no window), its tests, and the .run package. Attached to published releases.
+
+on:
+  push:
+    paths:
+      - "installer/**"
+      - "linux/**"
+      - ".github/workflows/linux-setup.yml"
+  pull_request:
+    paths:
+      - "installer/**"
+      - "linux/**"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  package:
+    name: Test and package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+          cache-workspaces: installer
+
+      - name: Setup core without the window (as linux/setup.py builds it)
+        working-directory: installer
+        run: |
+          cargo fmt --check
+          cargo clippy --release --locked --no-default-features -- -D warnings
+          cargo test --locked --no-default-features
+
+      - name: Linux setup scripts
+        run: |
+          python3 -m py_compile linux/setup.py
+          sh -n linux/launch.sh
+          sh -n linux/package.sh
+
+      - name: Package
+        run: |
+          sh linux/package.sh --repo "https://github.com/${{ github.repository }}.git" --branch "${{ github.event.repository.default_branch }}"
+          f=dist/Saints-Reborn-Linux-Setup.run
+          tail -n +"$(awk '/^__SAINTSREBORN_PAYLOAD__$/ { print NR + 1; exit }' "$f")" "$f" | tar -tz | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Saints-Reborn-Linux-Setup
+          path: dist/Saints-Reborn-Linux-Setup.run
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/Saints-Reborn-Linux-Setup.run --clobber

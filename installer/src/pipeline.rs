@@ -49,7 +49,7 @@ fn has_other_files(d: &Path) -> bool {
         .map(|rd| {
             rd.flatten().any(|e| {
                 let n = e.file_name().to_string_lossy().to_lowercase();
-                n != "setup-installer.log" && n != ".download"
+                n != "setup-installer.log" && n != ".download" && n != ".saintsreborn-setup"
             })
         })
         .unwrap_or(false)
@@ -136,6 +136,8 @@ pub fn run_all(r: &Reporter, o: &Options) -> Result<String> {
             ));
         }
     }
+    #[cfg(target_os = "linux")]
+    crate::linux::preflight(&dir)?;
     r.progress(None);
 
     let tc = tools::ensure_all(r, o.accept_license, &dir)?;
@@ -147,10 +149,18 @@ pub fn run_all(r: &Reporter, o: &Options) -> Result<String> {
     let updated = get_source(r, &tc, &dir)?;
     let dist = dir.join("dist");
     let build = dir.join("build");
-    let ready = dist.join("saintsrow.exe").exists() && dist.join("WhompaysModLoader.exe").exists();
     let stamps = Stamps(build.join("stamps"));
-    let toolchain_current = stamps.done("toolchain", config::TOOLCHAIN_ID);
-    if !updated && ready && toolchain_current && !o.force && o.game == GameSource::None {
+    let revision = capture(
+        tc.env
+            .command(&tc.git)
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "HEAD"]),
+    )
+    .context("Could not identify the downloaded source revision")?;
+    let install_key = format!("{} {}", config::TOOLCHAIN_ID, revision.trim());
+    if !updated && installed(&stamps, &dist, &install_key) && !o.force && o.game == GameSource::None
+    {
         r.status("Checking the online play files");
         let commit = sdk_commit(&dir);
         if let Err(e) = online::install(r, &dir, &dist, &commit, &downloads) {
@@ -159,7 +169,9 @@ pub fn run_all(r: &Reporter, o: &Options) -> Result<String> {
         finish(r, o, &dir);
         return Ok("Saints Reborn is already up to date.".into());
     }
+    stamps.clear("installed");
     build_game(r, &tc, o, &dir, &downloads)?;
+    stamps.mark("installed", &install_key)?;
     finish(r, o, &dir);
     Ok(if o.update {
         "Saints Reborn is updated."
@@ -167,6 +179,35 @@ pub fn run_all(r: &Reporter, o: &Options) -> Result<String> {
         "Saints Reborn is installed."
     }
     .into())
+}
+
+// A toolchain stamp is written before compilation and cannot prove success.
+fn installed(stamps: &Stamps, dist: &Path, key: &str) -> bool {
+    stamps.done("installed", key)
+        && dist.join("saintsrow.exe").is_file()
+        && dist.join("WhompaysModLoader.exe").is_file()
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn failed_build_with_old_executables_is_not_an_installed_revision() {
+        let root = std::env::temp_dir().join(format!("sr-completion-{}", std::process::id()));
+        fs::create_dir_all(root.join("stamps")).unwrap();
+        let stamps = Stamps(root.join("stamps"));
+        fs::write(root.join("saintsrow.exe"), b"old build").unwrap();
+        fs::write(root.join("WhompaysModLoader.exe"), b"old build").unwrap();
+        stamps.mark("toolchain", config::TOOLCHAIN_ID).unwrap();
+        assert!(!installed(&stamps, &root, "current revision"));
+        stamps.mark("installed", "current revision").unwrap();
+        assert!(installed(&stamps, &root, "current revision"));
+        assert!(!installed(&stamps, &root, "next revision"));
+        stamps.clear("installed");
+        assert!(!installed(&stamps, &root, "current revision"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// For CI: the toolchain, the SDK and the recompiler only (no game files
@@ -734,10 +775,18 @@ fn host_rexglue(
         fsx::require(&p, "The recompiler (rexglue.exe)")?;
         return Ok(p);
     }
+    #[cfg(unix)]
+    let source = prepare_host_source(r, &tc.env, &tc.git, sdk_src, build)?;
+    #[cfg(not(unix))]
+    let source = sdk_src.to_path_buf();
     let host = build.join("host").join("sdk");
     r.status("Building the recompiler for this PC");
     let mut c = tc.env.command(&tc.cmake);
-    c.arg("-S").arg(sdk_src).arg("-B").arg(&host).args([
+    // An exported SDK tree must not inherit the parent game's Git tags.
+    if let Some(parent) = source.parent() {
+        c.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    c.arg("-S").arg(&source).arg("-B").arg(&host).args([
         "-G",
         "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
@@ -749,10 +798,35 @@ fn host_rexglue(
         "-DCMAKE_CXX_FLAGS=-march=x86-64-v2",
         "-DCMAKE_CXX_STANDARD=23",
     ]);
+    let native = native_flags()?;
+    if !native.is_empty() {
+        c.arg(format!("-DCMAKE_C_FLAGS=-march=x86-64-v2 {native}"));
+        c.arg(format!("-DCMAKE_CXX_FLAGS=-march=x86-64-v2 {native}"));
+    }
     c.arg("-DCMAKE_LINKER_TYPE=LLD");
     c.arg(format!("-DCMAKE_MAKE_PROGRAM={}", cm(&ninja_path(tc))));
-    // Only the recompiler is built here: SDL needs no window or sound
-    // system, so no X11 / Wayland / ALSA development packages are needed.
+    // The SDK configures its UI targets even when only rexglue is built.
+    // Supply the private X11/Wayland metadata and avoid Conda's shell wrapper,
+    // which expects CC even though Env intentionally removes compiler flags.
+    if let Some(prefix) = std::env::var_os("SR_NATIVE_PREFIX") {
+        let prefix = PathBuf::from(prefix);
+        // Conda's iconv.h maps iconv_* to libiconv_*. Link the matching ABI
+        // explicitly, and reject unresolved native shared-library symbols.
+        c.args([
+            "-DCMAKE_C_STANDARD_LIBRARIES=-Wl,--no-as-needed -liconv -Wl,--as-needed",
+            "-DCMAKE_CXX_STANDARD_LIBRARIES=-Wl,--no-as-needed -liconv -Wl,--as-needed",
+            "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--no-undefined",
+        ]);
+        c.arg(format!(
+            "-DPKG_CONFIG_EXECUTABLE={}",
+            cm(&prefix.join("bin/pkg-config.bin"))
+        ));
+        c.env(
+            "PKG_CONFIG_PATH",
+            std::env::join_paths([prefix.join("lib/pkgconfig"), prefix.join("share/pkgconfig")])?,
+        );
+    }
+    // Keep SDL itself console-only; the SDK still needs UI headers above.
     c.args([
         "-DSDL_UNIX_CONSOLE_BUILD=ON",
         "-DSDL_X11=OFF",
@@ -771,16 +845,230 @@ fn host_rexglue(
     ]);
     run(r, c, "Configuring the recompiler", |_| {})?;
     let mut c = tc.env.command(&tc.cmake);
+    if let Some(parent) = source.parent() {
+        c.env("GIT_CEILING_DIRECTORIES", parent);
+    }
     c.arg("--build")
         .arg(&host)
         .args(["--target", "rexglue", "-j", jobs]);
-    run(r, c, "Building the recompiler", |l| progress_line(r, l)).context(LINUX_DEPS)?;
-    find_file(&host, "rexglue").context("The recompiler was built but not found")
+    run(r, c, "Building the recompiler", |l| progress_line(r, l))
+        .context("The native recompiler build failed; see the compiler or linker error above")?;
+    let rexglue = find_file(&source.join("out"), "rexglue")
+        .context("The recompiler was built but not found")?;
+    r.status("Checking the native recompiler runtime symbols");
+    let mut check = tc.env.command(&rexglue);
+    check.arg("--version").env("LD_BIND_NOW", "1");
+    run(r, check, "Checking the native recompiler runtime", |_| {})?;
+    Ok(rexglue)
 }
 
-const LINUX_DEPS: &str = "Building programs for this PC needs the C++ standard library headers. Install them \
-    (Debian/Ubuntu: sudo apt install build-essential, Fedora: sudo dnf install gcc-c++, Arch: sudo pacman -S \
-    base-devel) and press Install again";
+/// The game patch includes Windows-only networking and identity code. The
+/// native recompiler must use pristine SDK runtime sources at the same commit,
+/// plus the game's code-generation template so generated output still matches.
+#[cfg(unix)]
+fn prepare_host_source(
+    r: &Reporter,
+    env: &crate::report::Env,
+    git: &Path,
+    sdk_src: &Path,
+    build: &Path,
+) -> Result<PathBuf> {
+    let root = build.join("host");
+    let source = root.join("source");
+    let stamp = root.join("source.stamp");
+    let revision = capture(
+        env.command(git)
+            .arg("-C")
+            .arg(sdk_src)
+            .args(["rev-parse", "HEAD"]),
+    )
+    .context("Could not identify the SDK source revision")?;
+    let template = Path::new("resources/templates/codegen/pch_h.inja");
+    let key = format!(
+        "host-source-v1 {} {}",
+        revision.trim(),
+        sha1_file(&sdk_src.join(template))?
+    );
+    if fsx::read_text(&stamp).as_deref() == Some(key.as_str())
+        && source.join("CMakeLists.txt").is_file()
+    {
+        return Ok(source);
+    }
+    r.status("Preparing the native recompiler source (without Windows game runtime patches)");
+    fs::create_dir_all(&root)?;
+    // A CMake cache cannot be reused after changing its source directory.
+    fsx::remove_dir(&root.join("sdk"))?;
+    fsx::remove_dir(&source)?;
+    let archive = root.join("source.tar");
+    let mut cmd = env.command(git);
+    cmd.arg("-C")
+        .arg(sdk_src)
+        .args(["archive", "--format=tar"])
+        .arg("--output")
+        .arg(&archive)
+        .arg(revision.trim());
+    run(r, cmd, "Exporting the native SDK source", |_| {})?;
+    fsx::untar(r, &archive, &source, false, &|_| true)?;
+    fs::remove_file(archive)?;
+    let modules = capture(env.command(git).arg("-C").arg(sdk_src).args([
+        "config",
+        "--file",
+        ".gitmodules",
+        "--get-regexp",
+        "^submodule.*[.]path$",
+    ]))
+    .context("Could not read the SDK dependency paths")?;
+    for line in modules.lines() {
+        let (_, path) = line
+            .split_once(char::is_whitespace)
+            .context("Invalid SDK dependency path")?;
+        let relative = Path::new(path.trim());
+        if !relative.starts_with("thirdparty")
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            bail!("Invalid SDK dependency path: {}", relative.display());
+        }
+        let target = sdk_src.join(relative);
+        if !target.is_dir() {
+            bail!("SDK dependency missing: {}", target.display());
+        }
+        let link = source.join(relative);
+        fsx::remove_dir(&link)?;
+        fs::create_dir_all(link.parent().unwrap())?;
+        std::os::unix::fs::symlink(&target, &link)?;
+    }
+    fs::copy(sdk_src.join(template), source.join(template))?;
+    fsx::write_text(&stamp, &key)?;
+    Ok(source)
+}
+
+#[cfg(all(test, unix))]
+mod host_source_tests {
+    use super::*;
+
+    #[test]
+    fn native_snapshot_excludes_windows_runtime_patches_but_keeps_codegen_template() {
+        let root = std::env::temp_dir().join(format!("sr-host-source-{}", std::process::id()));
+        let sdk = root.join("sdk");
+        let template = Path::new("resources/templates/codegen/pch_h.inja");
+        for dir in [
+            "src/system",
+            "resources/templates/codegen",
+            "thirdparty/fixture",
+        ] {
+            fs::create_dir_all(sdk.join(dir)).unwrap();
+        }
+        fs::write(sdk.join("CMakeLists.txt"), "native SDK").unwrap();
+        fs::write(sdk.join("src/system/xsocket.cpp"), "native sockets").unwrap();
+        fs::write(sdk.join(template), "original template").unwrap();
+        fs::write(sdk.join("thirdparty/fixture/data"), "dependency").unwrap();
+        fs::write(sdk.join(".gitmodules"),
+            "[submodule \"fixture\"]\npath = thirdparty/fixture\nurl = https://example.invalid/fixture\n").unwrap();
+        let env = crate::report::Env::default();
+        let git = Path::new("git");
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(
+                env.command(git)
+                    .arg("-C")
+                    .arg(&sdk)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(sdk.join("src/system/xsocket.cpp"), "Windows socket changes").unwrap();
+        fs::write(
+            sdk.join("src/system/online_identity.cpp"),
+            "#include <windows.h>",
+        )
+        .unwrap();
+        fs::write(sdk.join(template), "game-specific generated code").unwrap();
+        let r = Reporter::new(
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
+        );
+        let build = root.join("build");
+        let source = prepare_host_source(&r, &env, git, &sdk, &build).unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("src/system/xsocket.cpp")).unwrap(),
+            "native sockets"
+        );
+        assert!(!source.join("src/system/online_identity.cpp").exists());
+        assert_eq!(
+            fs::read_to_string(source.join(template)).unwrap(),
+            "game-specific generated code"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("thirdparty/fixture/data")).unwrap(),
+            "dependency"
+        );
+        let cache = build.join("host/sdk/keep-cache");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, "compiled objects").unwrap();
+        prepare_host_source(&r, &env, git, &sdk, &build).unwrap();
+        assert!(cache.exists());
+        fs::write(sdk.join(template), "new game template").unwrap();
+        prepare_host_source(&r, &env, git, &sdk, &build).unwrap();
+        assert!(!cache.exists());
+        assert_eq!(
+            fs::read_to_string(source.join(template)).unwrap(),
+            "new game template"
+        );
+        assert_eq!(
+            fs::read_to_string(sdk.join("thirdparty/fixture/data")).unwrap(),
+            "dependency"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+// The plug-and-play launcher supplies a private native compiler sysroot.
+// Keep these options out of Windows cross-builds.
+fn native_args() -> Result<Vec<String>> {
+    let Some(prefix) = std::env::var_os("SR_NATIVE_PREFIX") else {
+        return Ok(Vec::new());
+    };
+    let prefix = PathBuf::from(prefix);
+    let sysroot = prefix.join("x86_64-conda-linux-gnu/sysroot");
+    let gcc = prefix.join("lib/gcc/x86_64-conda-linux-gnu");
+    let mut versions: Vec<PathBuf> = fs::read_dir(&gcc)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("crtbegin.o").is_file())
+        .collect();
+    versions.sort();
+    let gcc = versions
+        .last()
+        .context("Private GCC installation is incomplete")?;
+    Ok(vec![
+        format!("--sysroot={}", sysroot.display()),
+        format!("--gcc-install-dir={}", gcc.display()),
+        format!("-L{}", prefix.join("lib").display()),
+        format!("-Wl,-rpath,{}", prefix.join("lib").display()),
+    ])
+}
+
+fn native_flags() -> Result<String> {
+    Ok(native_args()?.join(" "))
+}
+
+const LINUX_DEPS: &str =
+    "A native helper could not be compiled; see the compiler or linker error above";
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     for e in fs::read_dir(dir).ok()?.flatten() {
@@ -812,6 +1100,7 @@ fn host_tool(
     for (i, s) in c_sources.iter().enumerate() {
         let o = objdir.join(format!("c{i}.o"));
         let mut c = tc.env.command(tc.clang());
+        c.args(native_args()?);
         c.args([
             "-O2",
             "-c",
@@ -826,6 +1115,7 @@ fn host_tool(
         objs.push(o);
     }
     let mut c = tc.env.command(tc.clangxx());
+    c.args(native_args()?);
     c.args([
         "-std=c++20",
         "-O2",
